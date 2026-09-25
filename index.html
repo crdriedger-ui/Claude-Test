@@ -1,0 +1,2026 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Peter's Putt-Putt Pandemonium</title>
+<!--
+  Peter's Putt-Putt Pandemonium
+  A personal, non-commercial Family Guy fan project.
+  Family Guy and its characters are owned by Fox. Not for sale or public distribution.
+
+  Everything (art, sound, physics, levels) lives in this one file.
+  Just open it in a modern browser. No server or build step needed.
+-->
+<style>
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: #1b1b2f;
+    overflow: hidden;
+    display: flex; align-items: center; justify-content: center;
+    touch-action: none;
+    user-select: none; -webkit-user-select: none;
+  }
+  canvas { display: block; cursor: crosshair; box-shadow: 0 0 40px rgba(0,0,0,.6); }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<script>
+'use strict';
+
+/* =====================================================================
+   1. CONSTANTS & SETUP
+   ===================================================================== */
+
+const W = 960, H = 540;          // Logical game resolution (scaled to fit the window)
+const GRAVITY    = 900;          // px/s^2
+const BALL_R     = 6;            // Ball radius
+const MAX_SPEED  = 950;          // Launch speed at 100% power (px/s)
+const BEER_MULT  = 1.45;         // Beer Boost power multiplier
+const MAX_DRAG   = 160;          // Drag distance (px) that equals 100% power
+const SUBSTEPS   = 10;           // Physics sub-steps per frame (prevents tunnelling)
+const CUP_HW     = 11;           // Half-width of the cup
+const CUP_DEPTH  = 18;           // Depth of the cup
+const GIVE_UP_OVER_PAR = 6;      // Peter picks up the ball at par + this many strokes
+const FONT = '"Comic Sans MS", "Chalkboard SE", "Comic Neue", "Marker Felt", sans-serif';
+
+const canvas = document.getElementById('game');
+const ctx = canvas.getContext('2d');
+let viewScale = 1;
+
+/** Resize the canvas to fit the window while keeping a 16:9 aspect ratio. */
+function resize() {
+  const dpr = window.devicePixelRatio || 1;
+  viewScale = Math.min(window.innerWidth / W, window.innerHeight / H);
+  canvas.style.width  = Math.floor(W * viewScale) + 'px';
+  canvas.style.height = Math.floor(H * viewScale) + 'px';
+  canvas.width  = Math.floor(W * viewScale * dpr);
+  canvas.height = Math.floor(H * viewScale * dpr);
+  ctx.setTransform(viewScale * dpr, 0, 0, viewScale * dpr, 0, 0);
+}
+window.addEventListener('resize', resize);
+resize();
+
+const rand  = (a, b) => a + Math.random() * (b - a);
+const pick  = arr => arr[Math.floor(Math.random() * arr.length)];
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+/* =====================================================================
+   2. SAVE DATA (localStorage)
+   ===================================================================== */
+
+const Store = {
+  key: 'peterPuttPutt.v1',
+  data: { bestTotal: null, bestHoles: Array(9).fill(null), bestBonus: null, bonusUnlocked: false },
+  load() {
+    try {
+      const saved = JSON.parse(localStorage.getItem(this.key));
+      if (saved) Object.assign(this.data, saved);
+    } catch (e) { /* private mode or blocked storage: play without saving */ }
+  },
+  save() {
+    try { localStorage.setItem(this.key, JSON.stringify(this.data)); } catch (e) {}
+  }
+};
+Store.load();
+
+/* =====================================================================
+   3. SOUND (Web Audio API, all synthesized, no audio files)
+   ===================================================================== */
+
+const Sound = {
+  ctx: null, master: null, noiseBuf: null, muted: false, lastBounce: 0,
+
+  /** Audio must be started from a user gesture, so this runs on the first click/key. */
+  init() {
+    if (this.ctx) { if (this.ctx.state === 'suspended') this.ctx.resume(); return; }
+    try {
+      this.ctx = new (window.AudioContext || window.webkitAudioContext)();
+      this.master = this.ctx.createGain();
+      this.master.gain.value = 0.5;
+      this.master.connect(this.ctx.destination);
+      // One second of white noise, reused for whooshes, splashes and crowds.
+      const len = this.ctx.sampleRate;
+      this.noiseBuf = this.ctx.createBuffer(1, len, this.ctx.sampleRate);
+      const d = this.noiseBuf.getChannelData(0);
+      for (let i = 0; i < len; i++) d[i] = Math.random() * 2 - 1;
+    } catch (e) { this.ctx = null; }
+  },
+
+  toggleMute() {
+    this.muted = !this.muted;
+    if (this.master) this.master.gain.value = this.muted ? 0 : 0.5;
+  },
+
+  /** Play a simple oscillator note with an optional pitch slide. */
+  tone(freq, dur, { type = 'sine', vol = 0.3, slide = null, delay = 0 } = {}) {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime + delay;
+    const osc = this.ctx.createOscillator();
+    const g = this.ctx.createGain();
+    osc.type = type;
+    osc.frequency.setValueAtTime(freq, t0);
+    if (slide) osc.frequency.exponentialRampToValueAtTime(slide, t0 + dur);
+    g.gain.setValueAtTime(vol, t0);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    osc.connect(g); g.connect(this.master);
+    osc.start(t0); osc.stop(t0 + dur + 0.05);
+  },
+
+  /** Play filtered noise, optionally sweeping the filter frequency. */
+  noise(dur, { vol = 0.3, freq = 1000, q = 1, type = 'bandpass', sweep = null, delay = 0 } = {}) {
+    if (!this.ctx || this.muted) return;
+    const t0 = this.ctx.currentTime + delay;
+    const src = this.ctx.createBufferSource();
+    src.buffer = this.noiseBuf;
+    src.loop = true;
+    const f = this.ctx.createBiquadFilter();
+    f.type = type; f.Q.value = q;
+    f.frequency.setValueAtTime(freq, t0);
+    if (sweep) f.frequency.exponentialRampToValueAtTime(sweep, t0 + dur);
+    const g = this.ctx.createGain();
+    g.gain.setValueAtTime(0.001, t0);
+    g.gain.exponentialRampToValueAtTime(vol, t0 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.001, t0 + dur);
+    src.connect(f); f.connect(g); g.connect(this.master);
+    src.start(t0, Math.random() * 0.5); src.stop(t0 + dur + 0.05);
+  },
+
+  // ---- Named effects ----
+  swing()  { this.noise(0.25, { freq: 400, sweep: 2600, q: 0.8, vol: 0.35 }); },
+  hit()    { this.tone(1300, 0.07, { type: 'square', vol: 0.12, slide: 500 }); this.noise(0.05, { freq: 3500, vol: 0.25 }); },
+  bounce(strength) {
+    if (!this.ctx) return;
+    const now = this.ctx.currentTime;
+    if (now - this.lastBounce < 0.06) return;
+    this.lastBounce = now;
+    this.tone(260 + strength * 200, 0.09, { type: 'triangle', vol: clamp(strength * 0.35, 0.04, 0.3), slide: 160 });
+  },
+  sand()   { this.noise(0.25, { type: 'lowpass', freq: 700, vol: 0.3 }); },
+  splash() {
+    this.noise(0.8, { type: 'lowpass', freq: 1600, sweep: 250, vol: 0.55 });
+    this.tone(500, 0.18, { slide: 120, vol: 0.18 });
+    this.noise(0.3, { type: 'highpass', freq: 3000, vol: 0.15, delay: 0.1 });
+  },
+  sink()   { [660, 880, 1320].forEach((f, i) => this.tone(f, 0.25, { vol: 0.2, delay: i * 0.09 })); },
+  cheer() {
+    for (let i = 0; i < 14; i++) this.noise(0.45, { freq: rand(1000, 2600), q: 4, vol: 0.1, delay: i * 0.07 });
+    [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.3, { type: 'triangle', vol: 0.12, delay: 0.1 + i * 0.1 }));
+  },
+  powerup() { [523, 659, 784, 1047].forEach((f, i) => this.tone(f, 0.12, { type: 'square', vol: 0.08, delay: i * 0.06 })); },
+  zap()    { this.tone(1600, 0.45, { type: 'sawtooth', vol: 0.1, slide: 180 }); this.tone(400, 0.45, { type: 'sine', vol: 0.15, slide: 1800 }); },
+  fizz()   { this.noise(0.5, { type: 'highpass', freq: 4000, vol: 0.18 }); },
+  burp()   { this.tone(120, 0.55, { type: 'sawtooth', vol: 0.22, slide: 55 }); this.noise(0.5, { type: 'lowpass', freq: 300, vol: 0.2 }); },
+  woof()   { this.tone(320, 0.12, { type: 'square', vol: 0.12, slide: 180 }); this.tone(300, 0.12, { type: 'square', vol: 0.12, slide: 170, delay: 0.18 }); },
+  squawk() { this.tone(700, 0.22, { type: 'sawtooth', vol: 0.18, slide: 1200 }); this.tone(1000, 0.25, { type: 'square', vol: 0.12, slide: 450, delay: 0.2 }); },
+  sting()  { [392, 523, 659, 523].forEach((f, i) => this.tone(f, 0.18, { type: 'triangle', vol: 0.15, delay: i * 0.12 })); },
+  punch()  { this.noise(0.12, { type: 'lowpass', freq: 500, vol: 0.5 }); this.tone(90, 0.15, { vol: 0.3, slide: 50 }); },
+  click()  { this.tone(800, 0.05, { type: 'square', vol: 0.07 }); },
+  sad()    { [392, 370, 349, 330].forEach((f, i) => this.tone(f, 0.35, { type: 'triangle', vol: 0.12, delay: i * 0.3 })); }
+};
+
+/* =====================================================================
+   4. PETER'S DIALOGUE (original lines, written in the show's spirit)
+   ===================================================================== */
+
+const LINES = {
+  holeInOne: [
+    "HOLE IN ONE! Bow before me, Quahog! I am the golf god now!",
+    "One shot?! Somebody alert the Pope! Or at least Quagmire!",
+    "I'm gonna have this moment carved into the side of a mountain. A small mountain. Like a hill."
+  ],
+  sunk: [
+    "It's in! Lois! LOIS! Get the camera! And a sandwich!",
+    "In the hole! Just like my savings account after Vegas!",
+    "Yes! I'm basically Tiger Woods, but with more chins!",
+    "Boom! That's going on the fridge. Right next to the other fridge."
+  ],
+  close: [
+    "Ooh, right up next to it! The hole's practically begging for it!",
+    "So close! Closer than me and the fridge at 3 a.m.",
+    "That's a gimme. In some countries. Probably."
+  ],
+  good: [
+    "Oh yeah! Somebody call the Golf Channel! A legend just happened!",
+    "Did you see that, Lois?! I'm a professional sports person now!",
+    "Nailed it! I'm getting that shot tattooed on my back. Well, on Joe's back.",
+    "Best thing I've done since I ate a whole cake without using my hands!",
+    "Take that, physics! Hehehehe."
+  ],
+  meh: [
+    "Eh, that's fine. That's a Tuesday shot.",
+    "Not bad, not great. Like a warm beer. Which I would still drink.",
+    "I meant to do that. Mostly. Some of it."
+  ],
+  bad: [
+    "That wasn't my fault! The sun got in my eyes. Also the moon. Also a bird.",
+    "This club is defective! I'm writing an angry letter to... golf.",
+    "I was distracted! I thought I heard an ice cream truck!",
+    "Stupid wind! Invisible air, always ruining everything!",
+    "Okay, that was a practice swing. Practice swings don't count. That's a rule."
+  ],
+  water: [
+    "Ahh! My ball! Call the Coast Guard! Or Aquaman! Whoever's cheaper!",
+    "Well, the fish needed a new toy. You're welcome, fish.",
+    "That's not a water hazard. My ball's just on vacation."
+  ],
+  sand: [
+    "Great. My ball's at the beach and I'm not. Typical.",
+    "Sand trap? More like sand... crap. Hey, that's pretty good.",
+    "I'll just dig it out. With my hands. Like a dog. A golf dog."
+  ],
+  giveUp: [
+    "Screw it, I'm picking it up. That's what the pros do, right? Right?"
+  ],
+  chickenHit: [
+    "Hey! Keep your filthy wings off my ball!",
+    "Oh, it is ON, you oversized nugget!",
+    "You call that a kick? I've been kicked harder by a vending machine!"
+  ],
+  beer: ["Beer Boost! Liquid courage, activate!", "Ahh, the golden fuel of champions!"],
+  burp: ["*BUUURRRP* ...POWER!", "*BRAAAP* Excuse me. Not really."],
+  gadget: ["Stewie's Rewind-o-Tron! No idea how it works. Don't care!", "Ha! Undo! I wish life had this button."],
+  noGadget: ["Nothing to undo yet. Gotta mess up first!"],
+  empty: ["I'm all out of that. Story of my life."],
+  hint: ["Hmm, I should probably hit the ball now. Or eat something. Ball first."]
+};
+
+const BRIAN_ADVICE = [
+  "Golf is merely a metaphor for man's futile struggle against the void.",
+  "I read in The New Yorker that the best shots come from within. Also, I'm writing a novel.",
+  "Try hitting it... well. That's all I've got. Want to read my screenplay?",
+  "Aim with your heart, Peter. And also your eyes. Mostly your eyes.",
+  "The key is to be very confident and slightly condescending. Trust me.",
+  "Have you considered not being bad at this? Just a thought."
+];
+
+/* Cutaway gags: a caption + a tiny scene drawn procedurally (see drawCutawayScene). */
+const CUTAWAYS = [
+  { scene: 'moon',       text: "This is worse than the time I got sent to the moon to fix the Wi-Fi." },
+  { scene: 'seagull',    text: "Reminds me of when I tried to train a seagull to be my caddy." },
+  { scene: 'vending',    text: "Still better than when my arm got stuck in the vending machine for three days." },
+  { scene: 'tv',         text: "Kinda like the time I sued my TV for showing me a sad commercial." },
+  { scene: 'bowling',    text: "Like when I went bowling with a watermelon. Lane 6 still smells like summer." },
+  { scene: 'lighthouse', text: "Like the time I was a lighthouse keeper and kept turning it off to save money." }
+];
+
+/* =====================================================================
+   5. HOLES
+   Each hole fits on one screen. Coordinates are in the 960x540 space.
+   ground   : polyline of the course surface (the cup notch is added automatically)
+   sand     : [x1, x2] ranges where the ground is sand
+   water    : rectangles; touching one = splash + 1 stroke penalty
+   movers   : sliding obstacles (kegs, the chicken), centred at cx/cy
+   windmills: rotating 4-blade windmills with a hub at x/y
+   pickups  : collectable power-ups
+   ===================================================================== */
+
+const HOLES = [
+  { name: 'Spooner Street', theme: 'street', par: 2, tee: 90, cup: { x: 720, y: 440 },
+    ground: [[0, 440], [960, 440]],
+    pickups: [{ x: 420, y: 330, type: 'brian' }],
+    tip: 'Click and drag BACK from anywhere, then let go to swing!' },
+
+  { name: 'The Griffin House', theme: 'house', par: 2, tee: 90, cup: { x: 800, y: 440 },
+    ground: [[0, 440], [280, 440], [380, 395], [520, 395], [610, 440], [960, 440]],
+    pickups: [{ x: 450, y: 320, type: 'beer' }],
+    tip: 'Hills! Loft it over or roll it up the front lawn.' },
+
+  { name: 'The Drunken Clam', theme: 'clam', par: 3, tee: 90, cup: { x: 790, y: 440 },
+    ground: [[0, 440], [230, 440], [320, 385], [370, 385], [370, 440], [450, 440], [470, 470], [590, 470], [610, 440], [960, 440]],
+    sand: [[452, 608]],
+    tip: 'Ramps launch you. Sand traps swallow you.' },
+
+  { name: 'Quahog Harbor', theme: 'harbor', par: 3, tee: 90, cup: { x: 760, y: 440 },
+    ground: [[0, 440], [260, 440], [285, 515], [525, 515], [550, 440], [960, 440]],
+    water: [{ x: 262, y: 458, w: 286, h: 100 }],
+    pickups: [{ x: 405, y: 300, type: 'gadget' }],
+    tip: 'Water costs a stroke. Peter cannot swim. Well, he can float.' },
+
+  { name: 'Pawtucket Brewery', theme: 'brewery', par: 3, tee: 90, cup: { x: 830, y: 395 },
+    ground: [[0, 440], [600, 440], [680, 395], [960, 395]],
+    movers: [{ type: 'keg', cx: 470, cy: 415, w: 46, h: 50, range: 100, speed: 1.3 }],
+    pickups: [{ x: 470, y: 250, type: 'gadget' }],
+    tip: 'Runaway keg! Go over it or time your roll.' },
+
+  { name: "Quagmire's Front Lawn", theme: 'street', par: 3, tee: 90, cup: { x: 840, y: 440 },
+    ground: [[0, 440], [620, 440], [635, 462], [705, 462], [720, 440], [960, 440]],
+    sand: [[622, 718]],
+    windmills: [{ x: 450, y: 330, len: 104, speed: 1.5 }],
+    tip: 'Windmill! Time it through the blades... or fly over.' },
+
+  { name: 'Brewery Vat Room', theme: 'brewery', par: 4, tee: 90, cup: { x: 860, y: 440 },
+    ground: [[0, 440], [210, 440], [228, 520], [330, 520], [330, 380], [420, 380], [420, 520], [548, 520], [566, 440], [960, 440]],
+    water: [{ x: 212, y: 455, w: 122, h: 100 }, { x: 416, y: 455, w: 148, h: 100 }],
+    movers: [{ type: 'keg', cx: 700, cy: 415, w: 46, h: 50, range: 70, speed: 1.8 }],
+    pickups: [{ x: 375, y: 300, type: 'beer' }],
+    tip: 'Island hop across the beer vats. Try not to drink them.' },
+
+  { name: 'Drunken Clam Back Alley', theme: 'clam', par: 4, tee: 90, cup: { x: 860, y: 440 },
+    ground: [[0, 440], [170, 440], [250, 400], [410, 400], [428, 520], [560, 520], [578, 440], [620, 440], [635, 465], [715, 465], [730, 440], [960, 440]],
+    windmills: [{ x: 330, y: 298, len: 98, speed: -1.7 }],
+    water: [{ x: 412, y: 455, w: 164, h: 100 }],
+    sand: [[622, 728]],
+    pickups: [{ x: 495, y: 330, type: 'brian' }],
+    tip: 'Windmill, puddle, sand. The Clam has everything.' },
+
+  { name: 'Spooner Street Showdown', theme: 'street', par: 5, tee: 60, cup: { x: 900, y: 440 },
+    ground: [[0, 440], [150, 440], [168, 465], [262, 465], [280, 440], [300, 440], [390, 372], [430, 372], [446, 520], [560, 520], [576, 440], [960, 440]],
+    sand: [[152, 278]],
+    water: [{ x: 432, y: 455, w: 142, h: 100 }],
+    windmills: [{ x: 680, y: 336, len: 100, speed: 1.8 }],
+    movers: [{ type: 'keg', cx: 805, cy: 415, w: 46, h: 50, range: 40, speed: 2.2 }],
+    pickups: [{ x: 505, y: 300, type: 'gadget' }],
+    tip: 'The final hole. Everything Quahog has, all at once.' }
+];
+
+const BONUS_HOLE = {
+  name: 'SECRET: The Chicken Fight', theme: 'chicken', par: 3, tee: 90, cup: { x: 860, y: 440 },
+  ground: [[0, 440], [960, 440]],
+  movers: [{ type: 'chicken', cx: 500, cy: 385, w: 70, h: 110, range: 170, speed: 1.1, hop: 55, hopSpeed: 2.1 }],
+  tip: "Get it past that giant chicken! It kicks. Hard.",
+  bonus: true
+};
+
+const START_INVENTORY = { beer: 1, gadget: 1, brian: 3 };
+const TOTAL_PAR = HOLES.reduce((s, h) => s + h.par, 0);
+const BONUS_UNLOCK_MARGIN = 6;   // Finish within par + this to unlock the chicken hole
+
+/* =====================================================================
+   6. GAME STATE
+   ===================================================================== */
+
+const game = {
+  state: 'title',      // title | play | paused | holeComplete | cutaway | chickenIntro | scorecard
+  holeIdx: 0,
+  playingBonus: false,
+  scores: [],          // strokes per hole for the current round
+  bonusScore: null,
+  strokes: 0,
+  inventory: { ...START_INVENTORY },
+  beerActive: false,
+  prevPos: null,       // Ball position before the last shot (for Stewie's Gadget)
+  lastShotCost: 1,
+  shotStartDist: 0,
+  lock: false,         // Blocks shooting during scripted moments
+  timers: [],
+  time: 0,
+  lastCutaway: -999,
+  cutaway: null,
+  intro: null,
+  banner: null,        // Hole title banner
+  speech: null,        // Peter's speech bubble
+  brianSpeech: null,
+  floaters: [],        // Floating "+1" style texts
+  particles: [],
+  holeResult: null,
+  newRecord: false,
+  secretBuf: '',
+  flash: 0
+};
+
+let L = null;          // The currently loaded level (runtime copy of a hole definition)
+
+const ball = { x: 0, y: 0, vx: 0, vy: 0, moving: false, passive: false, grounded: false,
+               onSand: false, gnx: 0, gny: -1, restTimer: 0, flightTime: 0, sunk: false, hidden: false };
+
+const peter = { x: 0, y: 0, facing: 1, swingT: -1, backAng: 0 };
+const CLUB_ADDRESS = 1.25;   // Club angle (radians) when resting behind the ball
+
+const input = { mx: 0, my: 0, down: false, aiming: false, sx: 0, sy: 0 };
+let uiButtons = [];          // Rebuilt every frame by the draw code (immediate-mode UI)
+
+/** Run a function after a delay (in game seconds, only ticks while playing). */
+function later(sec, fn) { game.timers.push({ t: sec, fn }); }
+
+/* =====================================================================
+   7. LEVEL LOADING
+   ===================================================================== */
+
+/** Insert the cup notch into a ground polyline at cup.x. */
+function insertCup(ground, cup) {
+  const out = [];
+  let done = false;
+  for (let i = 0; i < ground.length; i++) {
+    out.push(ground[i]);
+    const next = ground[i + 1];
+    if (!done && next && ground[i][0] <= cup.x - CUP_HW && next[0] >= cup.x + CUP_HW) {
+      out.push([cup.x - CUP_HW, cup.y], [cup.x - CUP_HW, cup.y + CUP_DEPTH],
+               [cup.x + CUP_HW, cup.y + CUP_DEPTH], [cup.x + CUP_HW, cup.y]);
+      done = true;
+    }
+  }
+  return out;
+}
+
+function buildLevel(def) {
+  const pts = insertCup(def.ground, def.cup);
+  const segs = [];
+  for (let i = 0; i < pts.length - 1; i++) {
+    segs.push({ x1: pts[i][0], y1: pts[i][1], x2: pts[i + 1][0], y2: pts[i + 1][1] });
+  }
+  // Invisible side walls keep the ball on screen.
+  segs.push({ x1: 0, y1: -3000, x2: 0, y2: H + 100 });
+  segs.push({ x1: W, y1: -3000, x2: W, y2: H + 100 });
+  return {
+    def, pts, segs, time: 0,
+    sand: def.sand || [],
+    water: def.water || [],
+    movers: (def.movers || []).map(m => ({ ...m, bx: m.cx, by: m.cy, vx: 0, vy: 0, facing: -1, kickCd: 0 })),
+    windmills: (def.windmills || []).map(w => ({ ...w, angle: 0.4 })),
+    pickups: (def.pickups || []).map(p => ({ ...p, taken: false }))
+  };
+}
+
+/** Highest ground surface at x (used to place the tee). */
+function groundYAt(x) {
+  let best = Infinity;
+  for (let i = 0; i < L.pts.length - 1; i++) {
+    const [x1, y1] = L.pts[i], [x2, y2] = L.pts[i + 1];
+    if (x1 === x2) continue;
+    if (x >= Math.min(x1, x2) && x <= Math.max(x1, x2)) {
+      const y = y1 + (y2 - y1) * (x - x1) / (x2 - x1);
+      if (y < best) best = y;
+    }
+  }
+  return best === Infinity ? 440 : best;
+}
+
+const inSand = x => L.sand.some(([a, b]) => x >= a && x <= b);
+
+function loadHole(def) {
+  L = buildLevel(def);
+  game.strokes = 0;
+  game.prevPos = null;
+  game.lock = false;
+  game.timers = [];
+  game.beerActive = false;
+  game.speech = null;
+  game.brianSpeech = null;
+  game.floaters = [];
+  game.particles = [];
+  game.pendingCutaway = false;
+  ball.x = def.tee;
+  ball.y = groundYAt(def.tee) - BALL_R;
+  ball.vx = ball.vy = 0;
+  ball.moving = ball.passive = ball.sunk = ball.hidden = false;
+  ball.restTimer = 0;
+  peter.facing = 1;
+  peter.x = ball.x - 26;
+  peter.y = ball.y + BALL_R;
+  peter.swingT = -1;
+  input.aiming = false;
+  game.banner = { t: 0, dur: 3.2 };
+}
+
+function startRound() {
+  game.scores = [];
+  game.bonusScore = null;
+  game.inventory = { ...START_INVENTORY };
+  game.holeIdx = 0;
+  game.playingBonus = false;
+  game.lastCutaway = -999;
+  loadHole(HOLES[0]);
+  game.state = 'play';
+}
+
+function startBonus(fromTitle) {
+  if (fromTitle) { game.scores = []; game.inventory = { ...START_INVENTORY }; }
+  game.playingBonus = true;
+  loadHole(BONUS_HOLE);
+  ball.hidden = true;             // The chicken has the ball during the intro
+  game.intro = { t: 0, dur: 6 };
+  game.state = 'chickenIntro';
+  Sound.squawk();
+}
+
+function currentDef() { return game.playingBonus ? BONUS_HOLE : HOLES[game.holeIdx]; }
+
+/* =====================================================================
+   8. PHYSICS
+   ===================================================================== */
+
+/**
+ * Circle-vs-segment collision. Pushes the ball out and reflects its velocity.
+ * o.vx/o.vy : velocity of the surface (moving kegs)
+ * o.rot     : {cx, cy, w} rotating surface (windmill blades)
+ * o.thick   : extra thickness added to the segment
+ * o.bounce  : restitution override
+ * Returns true if the ball touched the segment.
+ */
+function collideSeg(x1, y1, x2, y2, o) {
+  const r = BALL_R + (o.thick || 0);
+  const dx = x2 - x1, dy = y2 - y1;
+  const l2 = dx * dx + dy * dy || 1e-6;
+  let t = ((ball.x - x1) * dx + (ball.y - y1) * dy) / l2;
+  t = t < 0 ? 0 : t > 1 ? 1 : t;
+  const px = x1 + dx * t, py = y1 + dy * t;
+  const ex = ball.x - px, ey = ball.y - py;
+  const d2 = ex * ex + ey * ey;
+  if (d2 >= r * r) return false;
+
+  let nx, ny;
+  const d = Math.sqrt(d2);
+  if (d < 1e-6) { const l = Math.sqrt(l2); nx = -dy / l; ny = dx / l; }
+  else { nx = ex / d; ny = ey / d; }
+
+  // Push out of the surface.
+  ball.x = px + nx * r;
+  ball.y = py + ny * r;
+
+  // Velocity of the surface at the contact point.
+  let svx = o.vx || 0, svy = o.vy || 0;
+  if (o.rot) { svx = -o.rot.w * (py - o.rot.cy); svy = o.rot.w * (px - o.rot.cx); }
+
+  const rvx = ball.vx - svx, rvy = ball.vy - svy;
+  const vn = rvx * nx + rvy * ny;
+  const sandy = ny < -0.4 && inSand(ball.x);
+  if (vn < 0) {
+    let e = o.bounce != null ? o.bounce : 0.42;
+    if (sandy) e = 0.08;
+    if (-vn < 40 && o.bounce == null) e = 0;        // Let resting balls settle without jitter
+    const tx = rvx - vn * nx, ty = rvy - vn * ny;   // Tangential part is kept
+    ball.vx = tx - e * vn * nx + svx;
+    ball.vy = ty - e * vn * ny + svy;
+    if (-vn > 110) {
+      if (sandy) Sound.sand(); else Sound.bounce(Math.min(1, -vn / 700));
+      if (sandy) puff(ball.x, ball.y + BALL_R, '#e8cf8a', 6);
+    }
+  }
+  if (ny < -0.4) {                                   // Standing on something
+    ball.grounded = true;
+    ball.gnx = nx; ball.gny = ny;
+    if (sandy) ball.onSand = true;
+  }
+  return true;
+}
+
+/** Rectangle of a mover as four segments. */
+function moverSegs(m) {
+  const l = m.cx - m.w / 2, r = m.cx + m.w / 2, t = m.cy - m.h / 2, b = m.cy + m.h / 2;
+  return [[l, t, r, t], [r, t, r, b], [r, b, l, b], [l, b, l, t]];
+}
+
+function bladeTips(w) {
+  const tips = [];
+  for (let k = 0; k < 4; k++) {
+    const a = w.angle + k * Math.PI / 2;
+    tips.push([w.x + Math.cos(a) * w.len, w.y + Math.sin(a) * w.len]);
+  }
+  return tips;
+}
+
+/** Collide the ball with every moving thing. Returns true if anything was touched. */
+function collideDynamic() {
+  let any = false;
+  for (const m of L.movers) {
+    const o = { vx: m.vx, vy: m.vy, bounce: m.type === 'chicken' ? 0.8 : 0.45 };
+    let hit = false;
+    for (const s of moverSegs(m)) hit = collideSeg(s[0], s[1], s[2], s[3], o) || hit;
+    if (hit && m.type === 'chicken') chickenKick(m);
+    any = any || hit;
+  }
+  for (const w of L.windmills) {
+    const o = { rot: { cx: w.x, cy: w.y, w: w.speed }, thick: 4, bounce: 0.5 };
+    for (const [tx, ty] of bladeTips(w)) any = collideSeg(w.x, w.y, tx, ty, o) || any;
+  }
+  return any;
+}
+
+function chickenKick(m) {
+  if (m.kickCd > 0) return;
+  m.kickCd = 0.8;
+  const dir = ball.x < m.cx ? -1 : 1;
+  ball.vx = dir * rand(380, 600);
+  ball.vy = -rand(300, 480);
+  Sound.squawk();
+  feathers(ball.x, ball.y);
+  if (Math.random() < 0.7) say(pick(LINES.chickenHit), 2.2);
+}
+
+/** One physics sub-step for the ball. */
+function physicsStep(dt) {
+  ball.vy += GRAVITY * dt;
+  ball.x += ball.vx * dt;
+  ball.y += ball.vy * dt;
+  ball.grounded = false;
+  ball.onSand = false;
+
+  for (const s of L.segs) collideSeg(s.x1, s.y1, s.x2, s.y2, {});
+  collideDynamic();
+
+  // Rolling resistance: a constant deceleration along the ground (much higher in sand).
+  if (ball.grounded) {
+    const tx = -ball.gny, ty = ball.gnx;
+    const vt = ball.vx * tx + ball.vy * ty;
+    const decel = ball.onSand ? 700 : 75;
+    let nvt = vt - Math.sign(vt) * Math.min(Math.abs(vt), decel * dt);
+    nvt *= 1 - 0.3 * dt;
+    ball.vx += (nvt - vt) * tx;
+    ball.vy += (nvt - vt) * ty;
+  }
+}
+
+/* =====================================================================
+   9. SHOTS & RULES
+   ===================================================================== */
+
+function canShoot() {
+  return game.state === 'play' && !ball.moving && !ball.sunk && !game.lock;
+}
+
+/** Current aim from the drag gesture: pull back to shoot the opposite way. */
+function getAim() {
+  const dx = input.sx - input.mx, dy = input.sy - input.my;
+  const len = Math.hypot(dx, dy);
+  const power = clamp(len / MAX_DRAG, 0, 1);
+  const ang = Math.atan2(dy, dx);
+  return { power, ang, dirX: dx };
+}
+
+function shoot(power, ang) {
+  const speed = power * MAX_SPEED * (game.beerActive ? BEER_MULT : 1);
+  const c = L.def.cup;
+  game.prevPos = { x: ball.x, y: ball.y };
+  game.shotStartDist = Math.hypot(ball.x - c.x, ball.y - c.y);
+  game.lastShotCost = 1;
+  game.strokes++;
+  ball.vx = Math.cos(ang) * speed;
+  ball.vy = Math.sin(ang) * speed;
+  ball.moving = true;
+  ball.passive = false;
+  ball.restTimer = 0;
+  ball.flightTime = 0;
+  peter.swingT = 0;
+  Sound.swing();
+  setTimeout(() => Sound.hit(), 60);
+  game.speech = null;
+  if (game.beerActive) {
+    game.beerActive = false;
+    later(0.5, () => { Sound.burp(); say(pick(LINES.burp), 1.8); });
+  }
+}
+
+/** Called once the ball stops (or lands in water / out of bounds). */
+function shotFinished(result) {
+  ball.moving = false;
+  ball.vx = ball.vy = 0;
+
+  // A resting ball nudged by a keg or windmill: no commentary.
+  if (ball.passive) { ball.passive = false; return; }
+
+  const c = L.def.cup;
+  const dist = Math.hypot(ball.x - c.x, ball.y - c.y);
+  let cat;
+  if (result === 'water') cat = 'water';
+  else if (inSand(ball.x) && ball.grounded) cat = 'sand';
+  else if (dist < 45) cat = 'close';
+  else if (dist < game.shotStartDist * 0.45) cat = 'good';
+  else if (dist > game.shotStartDist * 0.85) cat = 'bad';
+  else cat = 'meh';
+
+  // Too many strokes: Peter gives up and moves on.
+  if (game.strokes >= L.def.par + GIVE_UP_OVER_PAR) {
+    say(LINES.giveUp[0], 2.5);
+    Sound.sad();
+    game.lock = true;
+    later(2.6, () => completeHole(true));
+    return;
+  }
+
+  say(pick(LINES[cat]), 2.8);
+  if (cat === 'good' || cat === 'close') Sound.cheer();
+
+  // Bad shots can trigger a cutaway gag.
+  const badShot = cat === 'bad' || cat === 'water' || cat === 'sand';
+  if (badShot && Math.random() < 0.4 && game.time - game.lastCutaway > 25) {
+    game.lock = true;
+    later(1.8, startCutaway);
+  }
+}
+
+function waterHazard() {
+  Sound.splash();
+  splash(ball.x, ball.y);
+  ball.hidden = true;
+  ball.moving = false;
+  ball.vx = ball.vy = 0;
+  game.strokes++;                       // Penalty stroke
+  game.lastShotCost = 2;
+  floater(ball.x, ball.y - 20, '+1 PENALTY', '#ff4d4d');
+  game.lock = true;
+  later(0.9, () => {
+    ball.x = game.prevPos.x; ball.y = game.prevPos.y;
+    ball.hidden = false;
+    game.lock = false;
+    shotFinished('water');
+  });
+}
+
+function sinkBall() {
+  const c = L.def.cup;
+  ball.sunk = true;
+  ball.moving = false;
+  ball.x = c.x; ball.y = c.y + CUP_DEPTH - BALL_R;
+  Sound.sink();
+  later(0.25, () => Sound.cheer());
+  confetti(c.x, c.y - 10);
+  say(pick(game.strokes === 1 ? LINES.holeInOne : L.def.bonus
+      ? ["Ha! Ball's in! Take THAT, you giant nugget! Peter wins!"] : LINES.sunk), 3);
+  if (game.strokes === 1) floater(c.x, c.y - 60, 'HOLE IN ONE!', '#ffd23f', 2.5);
+  game.lock = true;
+  later(2.4, () => completeHole(false));
+}
+
+function scoreName(strokes, par) {
+  if (strokes === 1) return 'HOLE IN ONE!';
+  const d = strokes - par;
+  return ({ '-3': 'Albatross!', '-2': 'Eagle!', '-1': 'Birdie!', '0': 'Par', '1': 'Bogey', '2': 'Double Bogey', '3': 'Triple Bogey' })[d]
+      || (d > 0 ? `+${d}` : `${d}`);
+}
+
+function completeHole(gaveUp) {
+  const def = L.def;
+  let record = false;
+  if (game.playingBonus) {
+    game.bonusScore = game.strokes;
+    if (Store.data.bestBonus == null || game.strokes < Store.data.bestBonus) { Store.data.bestBonus = game.strokes; record = true; }
+  } else {
+    game.scores[game.holeIdx] = game.strokes;
+    const b = Store.data.bestHoles[game.holeIdx];
+    if (!gaveUp && (b == null || game.strokes < b)) { Store.data.bestHoles[game.holeIdx] = game.strokes; record = true; }
+  }
+  Store.save();
+  game.holeResult = { strokes: game.strokes, par: def.par, gaveUp, record,
+                      name: gaveUp ? 'Peter gave up' : scoreName(game.strokes, def.par) };
+  game.state = 'holeComplete';
+}
+
+function nextAfterHole() {
+  if (!game.playingBonus && game.holeIdx < HOLES.length - 1) {
+    game.holeIdx++;
+    loadHole(HOLES[game.holeIdx]);
+    game.state = 'play';
+  } else {
+    finishRound();
+  }
+}
+
+function finishRound() {
+  game.newRecord = false;
+  if (game.scores.length === HOLES.length && !game.playingBonus) {
+    const total = game.scores.reduce((a, b) => a + b, 0);
+    if (Store.data.bestTotal == null || total < Store.data.bestTotal) { Store.data.bestTotal = total; game.newRecord = true; }
+    if (total <= TOTAL_PAR + BONUS_UNLOCK_MARGIN) Store.data.bonusUnlocked = true;
+    Store.save();
+  }
+  game.state = 'scorecard';
+}
+
+/* ---------- Power-ups ---------- */
+
+function useBeer() {
+  if (!canShoot()) return;
+  if (game.beerActive) return;
+  if (game.inventory.beer <= 0) return say(pick(LINES.empty), 1.8);
+  game.inventory.beer--;
+  game.beerActive = true;
+  Sound.fizz(); Sound.powerup();
+  say(pick(LINES.beer), 2);
+}
+
+function useGadget() {
+  if (!canShoot()) return;
+  if (game.inventory.gadget <= 0) return say(pick(LINES.empty), 1.8);
+  if (!game.prevPos) return say(LINES.noGadget[0], 1.8);
+  game.inventory.gadget--;
+  sparkle(ball.x, ball.y);
+  ball.x = game.prevPos.x; ball.y = game.prevPos.y;
+  sparkle(ball.x, ball.y);
+  game.strokes = Math.max(0, game.strokes - game.lastShotCost);
+  game.prevPos = null;
+  floater(ball.x, ball.y - 30, `-${game.lastShotCost} STROKE`, '#7df9ff');
+  game.flash = 0.35;
+  Sound.zap();
+  say(pick(LINES.gadget), 2.2);
+}
+
+function useBrian() {
+  if (game.state !== 'play') return;
+  if (game.inventory.brian <= 0) return say(pick(LINES.empty), 1.8);
+  game.inventory.brian--;
+  Sound.woof();
+  // Brian's advice has absolutely no effect on the game. That's the joke.
+  game.brianSpeech = { text: pick(BRIAN_ADVICE), t: 0, dur: 4.5 };
+  later(4.2, () => say(pick(["...Thanks, Brian. Super helpful.", "Yeah, I'm not listening, Brian.", "Did you just read that off a coffee mug?"]), 2));
+}
+
+function collectPickup(p) {
+  p.taken = true;
+  game.inventory[p.type]++;
+  Sound.powerup();
+  sparkle(p.x, p.y);
+  floater(p.x, p.y - 20, { beer: '+1 Beer Boost', gadget: "+1 Stewie's Gadget", brian: "+1 Brian's Advice" }[p.type], '#ffe066');
+}
+
+/* ---------- Cutaways ---------- */
+
+function startCutaway() {
+  game.lastCutaway = game.time;
+  game.cutaway = { idx: Math.floor(Math.random() * CUTAWAYS.length), t: 0, dur: 5 };
+  game.state = 'cutaway';
+  game.speech = null;
+  Sound.sting();
+}
+
+function endCutaway() {
+  game.cutaway = null;
+  game.state = 'play';
+  game.lock = false;
+}
+
+/* =====================================================================
+   10. EFFECTS (particles, speech, floating text)
+   ===================================================================== */
+
+function say(text, dur = 2.5) { game.speech = { text, t: 0, dur }; }
+function floater(x, y, text, color, dur = 1.6) { game.floaters.push({ x, y, text, color, t: 0, dur }); }
+
+function addParticles(n, x, y, fn) { for (let i = 0; i < n; i++) game.particles.push(fn(x, y)); }
+function splash(x, y) {
+  addParticles(30, x, y, () => ({ x, y, vx: rand(-160, 160), vy: rand(-380, -120), g: 900, life: rand(0.6, 1), t: 0, size: rand(2, 5), color: pick(['#8fd3ff', '#cdefff', '#4aa8e0']) }));
+}
+function puff(x, y, color, n) {
+  addParticles(n, x, y, () => ({ x, y, vx: rand(-60, 60), vy: rand(-100, -20), g: 200, life: rand(0.3, 0.6), t: 0, size: rand(2, 4), color }));
+}
+function confetti(x, y) {
+  addParticles(80, x, y, () => ({ x, y, vx: rand(-260, 260), vy: rand(-520, -150), g: 500, life: rand(1.2, 2.2), t: 0, size: rand(3, 6), color: pick(['#ff4d6d', '#ffd23f', '#3ec1d3', '#7bd389', '#b388eb']), spin: rand(0, 6) }));
+}
+function sparkle(x, y) {
+  addParticles(24, x, y, () => ({ x, y, vx: rand(-150, 150), vy: rand(-150, 150), g: 0, life: rand(0.4, 0.8), t: 0, size: rand(2, 4), color: pick(['#7df9ff', '#ffffff', '#c3a6ff']) }));
+}
+function feathers(x, y) {
+  addParticles(14, x, y, () => ({ x, y, vx: rand(-120, 120), vy: rand(-160, -40), g: 60, life: rand(1, 1.8), t: 0, size: rand(3, 6), color: '#fffbe8', spin: rand(0, 6) }));
+}
+
+function updateEffects(dt) {
+  for (const p of game.particles) { p.t += dt; p.vy += p.g * dt; p.x += p.vx * dt; p.y += p.vy * dt; }
+  game.particles = game.particles.filter(p => p.t < p.life);
+  for (const f of game.floaters) f.t += dt;
+  game.floaters = game.floaters.filter(f => f.t < f.dur);
+  if (game.speech) { game.speech.t += dt; if (game.speech.t > game.speech.dur) game.speech = null; }
+  if (game.brianSpeech) { game.brianSpeech.t += dt; if (game.brianSpeech.t > game.brianSpeech.dur) game.brianSpeech = null; }
+  if (game.flash > 0) game.flash -= dt;
+}
+
+/* =====================================================================
+   11. UPDATE LOOP
+   ===================================================================== */
+
+function updateLevelObjects(dt) {
+  L.time += dt;
+  for (const m of L.movers) {
+    const nx = m.bx + Math.sin(L.time * m.speed) * m.range;
+    const ny = m.hop ? m.by - Math.abs(Math.sin(L.time * m.hopSpeed)) * m.hop : m.by;
+    m.vx = (nx - m.cx) / dt;
+    m.vy = (ny - m.cy) / dt;
+    m.cx = nx; m.cy = ny;
+    if (Math.abs(m.vx) > 5) m.facing = m.vx > 0 ? 1 : -1;
+    m.kickCd = Math.max(0, m.kickCd - dt);
+  }
+  for (const w of L.windmills) w.angle += w.speed * dt;
+}
+
+function updatePlay(dt) {
+  updateLevelObjects(dt);
+
+  // Scheduled events
+  for (const tm of game.timers) tm.t -= dt;
+  const due = game.timers.filter(tm => tm.t <= 0);
+  game.timers = game.timers.filter(tm => tm.t > 0);
+  due.forEach(tm => tm.fn());
+  if (game.state !== 'play') return;
+
+  if (game.banner) { game.banner.t += dt; if (game.banner.t > game.banner.dur) game.banner = null; }
+
+  // A resting ball can still be shoved by kegs, blades or the chicken.
+  if (!ball.moving && !ball.sunk && !ball.hidden) {
+    const sx = ball.x, sy = ball.y;
+    if (collideDynamic()) {
+      ball.x = sx; ball.y = sy;
+      ball.moving = true;
+      ball.passive = true;
+      ball.restTimer = 0;
+      ball.flightTime = 0;
+      input.aiming = false;
+    }
+  }
+
+  if (ball.moving) {
+    const sdt = dt / SUBSTEPS;
+    for (let i = 0; i < SUBSTEPS && ball.moving; i++) {
+      physicsStep(sdt);
+
+      // Water?
+      for (const w of L.water) {
+        if (ball.x > w.x && ball.x < w.x + w.w && ball.y > w.y) {
+          if (!game.prevPos) game.prevPos = { x: L.def.tee, y: groundYAt(L.def.tee) - BALL_R };
+          waterHazard(); break;
+        }
+      }
+      if (!ball.moving) break;
+
+      // In the cup?
+      const c = L.def.cup;
+      if (Math.abs(ball.x - c.x) < CUP_HW && ball.y > c.y + 2) { sinkBall(); break; }
+
+      // Power-up pickups
+      for (const p of L.pickups) {
+        if (!p.taken && Math.hypot(ball.x - p.x, ball.y - p.y) < 18) collectPickup(p);
+      }
+    }
+
+    if (ball.moving) {
+      ball.flightTime += dt;
+      const speed = Math.hypot(ball.vx, ball.vy);
+      ball.restTimer = (ball.grounded && speed < 12) ? ball.restTimer + dt : 0;
+      if (ball.restTimer > 0.3 || ball.flightTime > 20) shotFinished('rest');
+    }
+  }
+
+  // Peter walks over to the ball when it is at rest.
+  if (!ball.moving && !ball.sunk && !ball.hidden && peter.swingT < 0) {
+    let facing = peter.facing;
+    if (input.aiming) { const a = getAim(); if (a.power > 0.03) facing = a.dirX >= 0 ? 1 : -1; }
+    if (ball.x < 40) facing = 1;
+    if (ball.x > W - 40) facing = -1;
+    peter.facing = facing;
+    const tx = ball.x - 26 * facing;
+    peter.x += (tx - peter.x) * Math.min(1, dt * 8);
+    peter.y += (ball.y + BALL_R - peter.y) * Math.min(1, dt * 8);
+  }
+  if (peter.swingT >= 0) { peter.swingT += dt; if (peter.swingT > 0.9) peter.swingT = -1; }
+}
+
+function update(dt) {
+  game.time += dt;
+  switch (game.state) {
+    case 'play':
+      updatePlay(dt);
+      updateEffects(dt);
+      break;
+    case 'holeComplete':
+    case 'scorecard':
+      updateEffects(dt);
+      break;
+    case 'cutaway':
+      game.cutaway.t += dt;
+      if (game.cutaway.t > game.cutaway.dur) endCutaway();
+      break;
+    case 'chickenIntro': {
+      const it = game.intro;
+      const before = it.t;
+      it.t += dt;
+      // Punch sounds during the brawl
+      if (it.t > 1.6 && it.t < 4.2 && Math.floor(it.t * 5) !== Math.floor(before * 5)) Sound.punch();
+      if (it.t > 4.2 && before <= 4.2) Sound.cheer();
+      if (it.t > it.dur) endIntro();
+      break;
+    }
+  }
+}
+
+function endIntro() {
+  game.intro = null;
+  ball.hidden = false;
+  game.state = 'play';
+  say("That's MY ball, you overgrown drumstick! Now watch me sink it!", 3);
+}
+
+/* =====================================================================
+   12. DRAWING HELPERS
+   ===================================================================== */
+
+function ellipse(x, y, rx, ry, fill, stroke, lw = 2) {
+  ctx.beginPath(); ctx.ellipse(x, y, rx, ry, 0, 0, Math.PI * 2);
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+}
+function rrect(x, y, w, h, r, fill, stroke, lw = 2) {
+  ctx.beginPath();
+  ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
+  if (fill) { ctx.fillStyle = fill; ctx.fill(); }
+  if (stroke) { ctx.strokeStyle = stroke; ctx.lineWidth = lw; ctx.stroke(); }
+}
+function line(x1, y1, x2, y2, color, lw = 2) {
+  ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2);
+  ctx.strokeStyle = color; ctx.lineWidth = lw; ctx.lineCap = 'round'; ctx.stroke();
+}
+function text(str, x, y, { size = 20, color = '#fff', align = 'center', outline = null, ow = 4, weight = 'bold', base = 'middle' } = {}) {
+  ctx.font = `${weight} ${size}px ${FONT}`;
+  ctx.textAlign = align; ctx.textBaseline = base;
+  if (outline) { ctx.lineWidth = ow; ctx.strokeStyle = outline; ctx.lineJoin = 'round'; ctx.strokeText(str, x, y); }
+  ctx.fillStyle = color; ctx.fillText(str, x, y);
+}
+function wrap(str, maxW, size) {
+  ctx.font = `bold ${size}px ${FONT}`;
+  const words = str.split(' '); const lines = []; let cur = '';
+  for (const w of words) {
+    const test = cur ? cur + ' ' + w : w;
+    if (ctx.measureText(test).width > maxW && cur) { lines.push(cur); cur = w; } else cur = test;
+  }
+  if (cur) lines.push(cur);
+  return lines;
+}
+
+/** Immediate-mode button: draws it and registers it for click handling this frame. */
+function button(label, x, y, w, h, onClick, { color = '#ffd23f', textColor = '#222', size = 22 } = {}) {
+  const hover = input.mx > x && input.mx < x + w && input.my > y && input.my < y + h;
+  rrect(x, y + 4, w, h, 12, 'rgba(0,0,0,.35)');
+  rrect(x, y - (hover ? 2 : 0), w, h, 12, hover ? '#fff3b0' : color, '#222', 3);
+  text(label, x + w / 2, y + h / 2 - (hover ? 2 : 0), { size, color: textColor });
+  uiButtons.push({ x, y, w, h, onClick });
+}
+
+/** Comic speech bubble pointing at (tx, ty). */
+function speechBubble(str, tx, ty, { bg = '#fff', maxW = 260, size = 15, alpha = 1 } = {}) {
+  const lines = wrap(str, maxW, size);
+  ctx.font = `bold ${size}px ${FONT}`;
+  const bw = Math.max(...lines.map(l => ctx.measureText(l).width)) + 24;
+  const bh = lines.length * (size + 4) + 16;
+  let bx = clamp(tx - bw / 2, 8, W - bw - 8);
+  let by = ty - bh - 22;
+  let below = false;
+  if (by < 60) { by = ty + 30; below = true; }
+  ctx.save();
+  ctx.globalAlpha = alpha;
+  rrect(bx, by, bw, bh, 14, bg, '#222', 3);
+  // tail
+  ctx.beginPath();
+  const tailX = clamp(tx, bx + 18, bx + bw - 18);
+  if (!below) { ctx.moveTo(tailX - 10, by + bh - 2); ctx.lineTo(tx, ty - 4); ctx.lineTo(tailX + 8, by + bh - 2); }
+  else { ctx.moveTo(tailX - 10, by + 2); ctx.lineTo(tx, ty + 4); ctx.lineTo(tailX + 8, by + 2); }
+  ctx.fillStyle = bg; ctx.fill(); ctx.strokeStyle = '#222'; ctx.lineWidth = 3; ctx.stroke();
+  ctx.fillRect(tailX - 8, below ? by + 2 : by + bh - 5, 15, 4);
+  lines.forEach((l, i) => text(l, bx + bw / 2, by + 8 + (size + 4) * i + size / 2 + 2, { size, color: '#222' }));
+  ctx.restore();
+}
+
+/* =====================================================================
+   13. CHARACTER DRAWING (simple-shape placeholder art)
+   ===================================================================== */
+
+const SKIN = '#f9d5b3';
+
+/**
+ * Peter, drawn from simple shapes. (x, y) is between his feet.
+ * clubAng: club angle in radians from his hands (null = no club).
+ */
+function drawPeter(x, y, facing = 1, clubAng = CLUB_ADDRESS, scale = 1, mood = 'normal') {
+  ctx.save();
+  ctx.translate(x, y);
+  ctx.scale(facing * scale, scale);
+  ctx.lineJoin = 'round';
+  // Shoes
+  ellipse(-8, -3, 9, 4, '#222');
+  ellipse(10, -3, 9, 4, '#222');
+  // Pants (green)
+  rrect(-15, -30, 30, 28, 5, '#3f7d3a', '#1f3f1d', 2);
+  line(0, -16, 0, -3, '#1f3f1d', 2);
+  // Belly (white shirt)
+  ellipse(1, -45, 21, 20, '#ffffff', '#888', 2);
+  // Belt
+  ctx.fillStyle = '#4a2f14'; ctx.fillRect(-15, -31, 30, 4);
+  // Head
+  ellipse(3, -73, 13, 13, SKIN, '#b38b6d', 1.5);
+  // Ear
+  ellipse(-8, -72, 3, 4, SKIN, '#b38b6d', 1.2);
+  // Hair
+  ctx.beginPath(); ctx.arc(1, -76, 12, Math.PI * 1.05, Math.PI * 1.75); ctx.strokeStyle = '#5b3a1e'; ctx.lineWidth = 5; ctx.stroke();
+  // The famous chin
+  ellipse(9, -61, 6.5, 5.5, SKIN, '#b38b6d', 1.5);
+  // Glasses
+  ellipse(7, -76, 5.2, 5.2, '#fff', '#222', 1.8);
+  ellipse(17, -76, 5.2, 5.2, '#fff', '#222', 1.8);
+  ellipse(8.5, -76, 1.6, 1.8, '#222');
+  ellipse(18.5, -76, 1.6, 1.8, '#222');
+  // Mouth
+  if (mood === 'happy') { ctx.beginPath(); ctx.arc(14, -67, 4, 0.1, Math.PI - 0.1); ctx.strokeStyle = '#6b3a2a'; ctx.lineWidth = 2; ctx.stroke(); }
+  else if (mood === 'sad') { ctx.beginPath(); ctx.arc(14, -63, 4, Math.PI + 0.3, -0.3); ctx.strokeStyle = '#6b3a2a'; ctx.lineWidth = 2; ctx.stroke(); }
+  else line(10, -66, 18, -67, '#6b3a2a', 2);
+
+  const gx = 13, gy = -44;  // Hands / club grip
+  if (clubAng !== null) {
+    const cx = gx + Math.cos(clubAng) * 39, cy = gy + Math.sin(clubAng) * 39;
+    line(gx, gy, cx, cy, '#aaa', 3);
+    // Club head, roughly perpendicular to the shaft
+    ctx.save(); ctx.translate(cx, cy); ctx.rotate(clubAng - Math.PI / 2);
+    rrect(-2, -3, 11, 6, 2, '#444');
+    ctx.restore();
+  }
+  // Arms
+  line(-2, -56, gx, gy, SKIN, 7);
+  line(5, -56, gx, gy, SKIN, 7);
+  ellipse(gx, gy, 4.5, 4.5, SKIN, '#b38b6d', 1);
+  ctx.restore();
+}
+
+/** The club angle for Peter right now, based on aiming or the swing animation. */
+function peterClubAngle() {
+  if (peter.swingT >= 0) {
+    const t = peter.swingT;
+    const follow = CLUB_ADDRESS - 1.9;
+    if (t < 0.15) return peter.backAng + (follow - peter.backAng) * (t / 0.15);
+    if (t < 0.6) return follow;
+    return follow + (CLUB_ADDRESS - follow) * ((t - 0.6) / 0.3);
+  }
+  if (input.aiming && canShoot()) return CLUB_ADDRESS + getAim().power * 2.5;
+  return CLUB_ADDRESS;
+}
+
+function drawBrian(x, y, scale = 1) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(scale, scale);
+  // Body hint + red collar
+  ellipse(0, 30, 18, 14, '#fff', '#888', 2);
+  ctx.fillStyle = '#d62828'; ctx.fillRect(-12, 14, 24, 5);
+  // Head
+  ellipse(0, 0, 15, 15, '#fff', '#888', 2);
+  // Ear
+  ctx.beginPath(); ctx.moveTo(-6, -12); ctx.quadraticCurveTo(-18, -22, -14, -2); ctx.closePath();
+  ctx.fillStyle = '#eee'; ctx.fill(); ctx.strokeStyle = '#888'; ctx.lineWidth = 1.5; ctx.stroke();
+  // Snout + nose
+  ellipse(-14, 4, 10, 6, '#fff', '#888', 1.5);
+  ellipse(-23, 2, 3.5, 3, '#222');
+  // Eye (half-lidded, pretentious)
+  ellipse(-5, -4, 4, 4, '#fff', '#222', 1.5);
+  ellipse(-6, -3, 1.6, 1.6, '#222');
+  line(-9, -6, -1, -6, '#888', 2);
+  // Martini
+  line(14, 6, 14, 22, '#bbb', 1.5);
+  ctx.beginPath(); ctx.moveTo(6, 0); ctx.lineTo(22, 0); ctx.lineTo(14, 8); ctx.closePath();
+  ctx.fillStyle = 'rgba(200,240,255,.8)'; ctx.fill(); ctx.strokeStyle = '#999'; ctx.stroke();
+  ellipse(14, 2, 2, 2, '#6a9a3a');
+  ctx.restore();
+}
+
+/** The giant chicken. (x, y) = bottom centre. */
+function drawChicken(x, y, facing = -1, t = 0, scale = 1, angry = true) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(facing * scale, scale);
+  const step = Math.sin(t * 12) * 6;
+  // Legs
+  line(-10, -30, -10 + step, 0, '#f4a300', 5);
+  line(10, -30, 10 - step, 0, '#f4a300', 5);
+  line(-10 + step, 0, -2 + step, 0, '#f4a300', 4);
+  line(10 - step, 0, 18 - step, 0, '#f4a300', 4);
+  // Body
+  ellipse(0, -55, 34, 30, '#fff6d8', '#8a7a55', 2.5);
+  // Tail feathers
+  ctx.beginPath(); ctx.moveTo(-30, -60); ctx.lineTo(-48, -82); ctx.lineTo(-40, -58); ctx.lineTo(-50, -66); ctx.lineTo(-32, -48); ctx.closePath();
+  ctx.fillStyle = '#fff6d8'; ctx.fill(); ctx.strokeStyle = '#8a7a55'; ctx.stroke();
+  // Wing
+  ellipse(-4, -52, 18, 12, '#f1e6c0', '#8a7a55', 2);
+  // Neck + head
+  ellipse(18, -86, 13, 20, '#fff6d8', '#8a7a55', 2.5);
+  // Comb
+  ctx.fillStyle = '#e63946';
+  [[12, -106], [19, -109], [26, -105]].forEach(([cx, cy]) => { ctx.beginPath(); ctx.arc(cx, cy, 5, 0, Math.PI * 2); ctx.fill(); });
+  // Beak
+  ctx.beginPath(); ctx.moveTo(30, -92); ctx.lineTo(44, -88); ctx.lineTo(30, -84); ctx.closePath();
+  ctx.fillStyle = '#f4a300'; ctx.fill(); ctx.strokeStyle = '#8a5a00'; ctx.stroke();
+  // Wattle
+  ellipse(30, -78, 3.5, 6, '#e63946');
+  // Eye + angry brow
+  ellipse(22, -94, 4, 4, '#fff', '#222', 1.5);
+  ellipse(23, -94, 1.8, 1.8, '#222');
+  if (angry) line(16, -101, 28, -97, '#222', 3);
+  ctx.restore();
+}
+
+/* =====================================================================
+   14. BACKGROUNDS (one per location)
+   ===================================================================== */
+
+function sky(top, bottom) {
+  const g = ctx.createLinearGradient(0, 0, 0, H);
+  g.addColorStop(0, top); g.addColorStop(1, bottom);
+  ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+}
+function clouds(t, color = 'rgba(255,255,255,.9)') {
+  for (let i = 0; i < 5; i++) {
+    const x = ((i * 230 + t * (8 + i * 3)) % (W + 200)) - 100;
+    const y = 50 + (i * 37) % 90;
+    ctx.fillStyle = color;
+    [[0, 0, 26], [24, -10, 22], [46, 0, 24], [22, 8, 22]].forEach(([dx, dy, r]) => {
+      ctx.beginPath(); ctx.arc(x + dx, y + dy, r, 0, Math.PI * 2); ctx.fill();
+    });
+  }
+}
+function house(x, baseY, w, h, wall, roof, opts = {}) {
+  ctx.fillStyle = wall; ctx.fillRect(x, baseY - h, w, h);
+  ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2; ctx.strokeRect(x, baseY - h, w, h);
+  ctx.beginPath(); ctx.moveTo(x - 10, baseY - h); ctx.lineTo(x + w / 2, baseY - h - h * 0.55); ctx.lineTo(x + w + 10, baseY - h); ctx.closePath();
+  ctx.fillStyle = roof; ctx.fill(); ctx.stroke();
+  // Windows + door
+  const win = opts.lit ? '#ffe28a' : '#bfe6ff';
+  ctx.fillStyle = win;
+  ctx.fillRect(x + w * 0.15, baseY - h * 0.75, w * 0.22, h * 0.25);
+  ctx.fillRect(x + w * 0.63, baseY - h * 0.75, w * 0.22, h * 0.25);
+  ctx.fillStyle = '#7a4a2a'; ctx.fillRect(x + w * 0.42, baseY - h * 0.45, w * 0.16, h * 0.45);
+}
+
+function drawBackground(theme, t) {
+  switch (theme) {
+    case 'street': {
+      sky('#5ec8ff', '#d8f3ff'); clouds(t);
+      const cols = [['#f6bd60', '#b5523b'], ['#84a59d', '#6d4c41'], ['#f28482', '#5b3a29'], ['#90be6d', '#7a3e2b'], ['#cdb4db', '#5a4a6b']];
+      for (let i = 0; i < 6; i++) { const c = cols[i % cols.length]; house(20 + i * 160, 400, 110, 80, c[0], c[1]); }
+      // Street sign
+      line(880, 440, 880, 330, '#666', 5);
+      rrect(820, 318, 120, 26, 4, '#2e8b57', '#fff', 2);
+      text('SPOONER ST', 880, 331, { size: 14 });
+      break;
+    }
+    case 'house': {
+      sky('#6fd0ff', '#e4f7ff'); clouds(t);
+      // The Griffin house: two storeys, porch, white trim
+      const x = 560, b = 400;
+      ctx.fillStyle = '#8fb3a0'; ctx.fillRect(x, b - 170, 280, 170);
+      ctx.strokeStyle = '#fff'; ctx.lineWidth = 4; ctx.strokeRect(x, b - 170, 280, 170);
+      ctx.beginPath(); ctx.moveTo(x - 20, b - 170); ctx.lineTo(x + 140, b - 250); ctx.lineTo(x + 300, b - 170); ctx.closePath();
+      ctx.fillStyle = '#5b4a45'; ctx.fill(); ctx.strokeStyle = '#fff'; ctx.stroke();
+      ctx.fillStyle = '#fff5c2';
+      [[x + 30, b - 150], [x + 110, b - 150], [x + 190, b - 150], [x + 30, b - 80], [x + 190, b - 80]].forEach(([wx, wy]) => {
+        ctx.fillRect(wx, wy, 50, 45); ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.strokeRect(wx, wy, 50, 45);
+      });
+      ctx.fillStyle = '#b5523b'; ctx.fillRect(x + 118, b - 80, 44, 80);
+      ctx.fillStyle = '#fff'; ctx.fillRect(x + 90, b - 92, 100, 8);
+      // Picket fence
+      for (let i = 0; i < 40; i++) {
+        const fx = i * 24 + 4;
+        ctx.fillStyle = '#fff'; ctx.fillRect(fx, 402, 12, 38);
+        ctx.beginPath(); ctx.moveTo(fx, 402); ctx.lineTo(fx + 6, 394); ctx.lineTo(fx + 12, 402); ctx.fill();
+      }
+      ctx.fillRect(0, 412, W, 5); ctx.fillRect(0, 428, W, 5);
+      text('THE GRIFFINS', x + 140, b - 196, { size: 16, color: '#fff', outline: '#5b4a45' });
+      break;
+    }
+    case 'clam': {
+      sky('#2b1a4a', '#c0508a');
+      // Stars
+      for (let i = 0; i < 40; i++) ellipse((i * 97) % W, (i * 53) % 200, 1.2, 1.2, `rgba(255,255,255,${0.4 + 0.4 * Math.sin(t * 2 + i)})`);
+      ellipse(840, 80, 30, 30, '#fff8d6');
+      // Bar building
+      ctx.fillStyle = '#7a3b2e'; ctx.fillRect(140, 250, 560, 190);
+      ctx.strokeStyle = '#3d1d17'; ctx.lineWidth = 1;
+      for (let row = 0; row < 12; row++) for (let col = 0; col < 28; col++) ctx.strokeRect(140 + col * 20 + (row % 2) * 10, 250 + row * 16, 20, 16);
+      ctx.fillStyle = '#ffd67a';
+      ctx.fillRect(180, 320, 110, 60); ctx.fillRect(550, 320, 110, 60);
+      ctx.fillStyle = '#3d1d17'; ctx.fillRect(385, 330, 70, 110);
+      // Neon sign (flickers)
+      const on = Math.sin(t * 13) > -0.9;
+      rrect(250, 190, 340, 56, 10, '#1a0f2e', on ? '#ff5ec4' : '#553', 4);
+      text('THE DRUNKEN CLAM', 420, 218, { size: 26, color: on ? '#ffe0f6' : '#776', outline: on ? '#ff2fb0' : null, ow: 6 });
+      // Clam icon
+      ctx.beginPath(); ctx.arc(420, 176, 18, Math.PI, 0); ctx.closePath();
+      ctx.fillStyle = on ? '#8ff0ff' : '#556'; ctx.fill();
+      break;
+    }
+    case 'harbor': {
+      sky('#7fd6ff', '#fff0d6'); clouds(t);
+      ctx.fillStyle = '#2f8fce'; ctx.fillRect(0, 330, W, 110);
+      for (let i = 0; i < 16; i++) line(((i * 70 + t * 20) % W), 350 + (i % 4) * 20, ((i * 70 + t * 20) % W) + 25, 350 + (i % 4) * 20, 'rgba(255,255,255,.6)', 2);
+      // Lighthouse
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(800, 340); ctx.lineTo(820, 190); ctx.lineTo(860, 190); ctx.lineTo(880, 340); ctx.fill();
+      ctx.fillStyle = '#e63946'; ctx.fillRect(812, 240, 56, 22); ctx.fillRect(806, 290, 68, 22);
+      ctx.fillStyle = '#333'; ctx.fillRect(815, 165, 50, 25);
+      ellipse(840, 177, 12, 8, '#ffe066');
+      // Boat
+      const bx = 150 + Math.sin(t * 0.3) * 60;
+      ctx.fillStyle = '#b5523b'; ctx.beginPath(); ctx.moveTo(bx, 330); ctx.lineTo(bx + 90, 330); ctx.lineTo(bx + 75, 350); ctx.lineTo(bx + 15, 350); ctx.fill();
+      line(bx + 45, 330, bx + 45, 270, '#6d4c41', 3);
+      ctx.fillStyle = '#fff'; ctx.beginPath(); ctx.moveTo(bx + 47, 272); ctx.lineTo(bx + 85, 325); ctx.lineTo(bx + 47, 325); ctx.fill();
+      text('QUAHOG HARBOR', 200, 190, { size: 22, color: '#fff', outline: '#2f8fce' });
+      break;
+    }
+    case 'brewery': {
+      sky('#8d99ae', '#dfe3ea');
+      // Smoke
+      for (let i = 0; i < 8; i++) {
+        const k = (t * 0.4 + i / 8) % 1;
+        ellipse(236 + k * 60, 150 - k * 140, 14 + k * 30, 12 + k * 24, `rgba(240,240,240,${0.7 * (1 - k)})`);
+        ellipse(716 + k * 50, 170 - k * 140, 12 + k * 28, 10 + k * 22, `rgba(240,240,240,${0.7 * (1 - k)})`);
+      }
+      ctx.fillStyle = '#6d4c41'; ctx.fillRect(220, 150, 32, 130); ctx.fillRect(700, 170, 32, 110);
+      ctx.fillStyle = '#8c3b2e'; ctx.fillRect(100, 260, 760, 180);
+      ctx.fillStyle = '#5c2a20'; for (let i = 0; i < 8; i++) ctx.fillRect(130 + i * 92, 300, 50, 70);
+      // Vats
+      for (let i = 0; i < 4; i++) {
+        const vx = 170 + i * 180;
+        rrect(vx, 330, 90, 110, 30, '#c0c7cf', '#6b7580', 3);
+        ctx.fillStyle = '#f2b134'; ctx.fillRect(vx + 10, 380, 70, 10);
+      }
+      rrect(290, 210, 380, 44, 8, '#f2b134', '#5c2a20', 4);
+      text('PAWTUCKET BREWERY', 480, 233, { size: 24, color: '#5c2a20' });
+      break;
+    }
+    case 'chicken': {
+      sky('#ff5e3a', '#ffd166');
+      // Dramatic rays
+      ctx.save(); ctx.translate(W / 2, 420);
+      for (let i = 0; i < 16; i++) {
+        ctx.rotate(Math.PI / 8 + t * 0.01);
+        ctx.fillStyle = i % 2 ? 'rgba(255,255,255,.12)' : 'rgba(255,120,60,.12)';
+        ctx.beginPath(); ctx.moveTo(0, 0); ctx.lineTo(900, -80); ctx.lineTo(900, 80); ctx.fill();
+      }
+      ctx.restore();
+      // Ruined street silhouette
+      ctx.fillStyle = 'rgba(60,20,20,.45)';
+      [[40, 120], [170, 180], [320, 90], [600, 160], [760, 110], [860, 150]].forEach(([x, h]) => ctx.fillRect(x, 440 - h, 90, h));
+      if (game.state === 'chickenIntro') text('ROUND 2... FIGHT!', W / 2, 120, { size: 30, color: '#fff', outline: '#8b1e1e', ow: 7 });
+      break;
+    }
+  }
+}
+
+/* =====================================================================
+   15. COURSE DRAWING
+   ===================================================================== */
+
+function drawWindmillTower(w) {
+  const groundY = groundYAt(w.x);
+  ctx.fillStyle = '#e9d8a6'; ctx.strokeStyle = '#7a5c2e'; ctx.lineWidth = 3;
+  ctx.beginPath();
+  ctx.moveTo(w.x - 45, groundY); ctx.lineTo(w.x - 25, w.y - 10); ctx.lineTo(w.x + 25, w.y - 10); ctx.lineTo(w.x + 45, groundY);
+  ctx.closePath(); ctx.fill(); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(w.x - 32, w.y - 8); ctx.lineTo(w.x, w.y - 45); ctx.lineTo(w.x + 32, w.y - 8); ctx.closePath();
+  ctx.fillStyle = '#c1121f'; ctx.fill(); ctx.stroke();
+  // Doorway (decorative)
+  ctx.fillStyle = '#5a3d1e'; ctx.beginPath(); ctx.arc(w.x, groundY - 16, 14, Math.PI, 0); ctx.fillRect(w.x - 14, groundY - 16, 28, 16); ctx.fill();
+}
+function drawWindmillBlades(w) {
+  for (const [tx, ty] of bladeTips(w)) {
+    line(w.x, w.y, tx, ty, '#6d4c41', 6);
+    // Sail
+    const a = Math.atan2(ty - w.y, tx - w.x);
+    ctx.save(); ctx.translate(w.x, w.y); ctx.rotate(a);
+    ctx.fillStyle = 'rgba(255,255,255,.85)'; ctx.fillRect(20, 3, w.len - 24, 13);
+    ctx.strokeStyle = '#6d4c41'; ctx.lineWidth = 1.5; ctx.strokeRect(20, 3, w.len - 24, 13);
+    ctx.restore();
+  }
+  ellipse(w.x, w.y, 7, 7, '#333');
+}
+
+function drawKeg(m) {
+  const x = m.cx - m.w / 2, y = m.cy - m.h / 2;
+  rrect(x, y, m.w, m.h, 10, '#a0673a', '#4a2c14', 3);
+  ctx.fillStyle = '#7b8a93'; ctx.fillRect(x, y + 8, m.w, 5); ctx.fillRect(x, y + m.h - 13, m.w, 5);
+  text('XXX', m.cx, m.cy, { size: 12, color: '#fff3c4' });
+}
+
+function drawGround() {
+  // Grass body
+  ctx.beginPath();
+  ctx.moveTo(L.pts[0][0], L.pts[0][1]);
+  for (const [x, y] of L.pts) ctx.lineTo(x, y);
+  ctx.lineTo(W, H); ctx.lineTo(0, H); ctx.closePath();
+  const g = ctx.createLinearGradient(0, 360, 0, H);
+  g.addColorStop(0, '#6ccf4f'); g.addColorStop(1, '#3a8a2e');
+  ctx.fillStyle = g; ctx.fill();
+  // Surface outline
+  ctx.beginPath(); ctx.moveTo(L.pts[0][0], L.pts[0][1]);
+  for (const [x, y] of L.pts) ctx.lineTo(x, y);
+  ctx.strokeStyle = '#2f6b22'; ctx.lineWidth = 4; ctx.lineJoin = 'round'; ctx.stroke();
+  // Sand strips
+  for (const [a, b] of L.sand) {
+    ctx.save(); ctx.beginPath(); ctx.rect(a, 0, b - a, H); ctx.clip();
+    ctx.beginPath(); ctx.moveTo(L.pts[0][0], L.pts[0][1] + 7);
+    for (const [x, y] of L.pts) ctx.lineTo(x, y + 7);
+    ctx.strokeStyle = '#ecd592'; ctx.lineWidth = 16; ctx.stroke();
+    ctx.fillStyle = '#c9ad62';
+    for (let x = a + 4; x < b; x += 9) ellipse(x, groundYAt(x) + 5 + (x % 3), 1.2, 1.2, '#c9ad62');
+    ctx.restore();
+  }
+}
+
+function drawWater(t) {
+  for (const w of L.water) {
+    ctx.fillStyle = 'rgba(40,140,220,.85)';
+    ctx.fillRect(w.x, w.y, w.w, w.h);
+    ctx.beginPath();
+    for (let x = w.x; x <= w.x + w.w; x += 4) ctx.lineTo(x, w.y + Math.sin(x * 0.08 + t * 3) * 2.5);
+    ctx.strokeStyle = '#cdefff'; ctx.lineWidth = 3; ctx.stroke();
+  }
+}
+
+function drawCupAndFlag(t) {
+  const c = L.def.cup;
+  ctx.fillStyle = '#1d2a14'; ctx.fillRect(c.x - CUP_HW, c.y, CUP_HW * 2, CUP_DEPTH);
+  line(c.x + 2, c.y + CUP_DEPTH - 2, c.x + 2, c.y - 85, '#eee', 3);
+  const wave = Math.sin(t * 4) * 4;
+  ctx.beginPath(); ctx.moveTo(c.x + 3, c.y - 85);
+  ctx.quadraticCurveTo(c.x + 22, c.y - 80 + wave, c.x + 42, c.y - 74 + wave);
+  ctx.lineTo(c.x + 3, c.y - 62); ctx.closePath();
+  ctx.fillStyle = L.def.bonus ? '#ffd23f' : '#e63946'; ctx.fill(); ctx.strokeStyle = '#7a1a22'; ctx.lineWidth = 2; ctx.stroke();
+  text(L.def.bonus ? '?' : String(game.holeIdx + 1), c.x + 17, c.y - 74 + wave / 2, { size: 13 });
+}
+
+function drawPickupIcon(type, x, y, s = 1) {
+  ctx.save(); ctx.translate(x, y); ctx.scale(s, s);
+  if (type === 'beer') {
+    rrect(-7, -11, 14, 22, 3, '#f2b134', '#6b4400', 2);
+    ellipse(0, -11, 7, 3, '#fff');
+    ctx.fillStyle = '#fff'; ctx.fillRect(-7, -2, 14, 5);
+  } else if (type === 'gadget') {
+    rrect(-11, -6, 18, 10, 3, '#9aa5b1', '#333', 2);
+    ctx.fillStyle = '#333'; ctx.fillRect(-6, 3, 5, 9);
+    ellipse(9, -1, 4, 4, '#ff3b3b', '#600', 1.5);
+    ellipse(-5, -1, 2, 2, '#7df9ff');
+  } else {
+    ellipse(0, 0, 10, 10, '#fff', '#888', 2);
+    ellipse(-9, 2, 6, 4, '#fff', '#888', 1.5);
+    ellipse(-14, 1, 2.2, 2, '#222');
+    ellipse(-2, -3, 1.6, 1.6, '#222');
+    ctx.fillStyle = '#d62828'; ctx.fillRect(-7, 9, 14, 3);
+  }
+  ctx.restore();
+}
+
+function drawPickups(t) {
+  for (const p of L.pickups) {
+    if (p.taken) continue;
+    const bob = Math.sin(t * 3 + p.x) * 4;
+    ellipse(p.x, p.y + bob, 17, 17, 'rgba(255,240,120,.35)', '#ffe066', 2);
+    drawPickupIcon(p.type, p.x, p.y + bob);
+  }
+}
+
+function drawBall() {
+  if (ball.hidden) return;
+  if (game.beerActive && !ball.moving) ellipse(ball.x, ball.y, 11 + Math.sin(game.time * 8) * 2, 11 + Math.sin(game.time * 8) * 2, 'rgba(242,177,52,.4)');
+  ellipse(ball.x, ball.y, BALL_R, BALL_R, '#fff', '#333', 1.5);
+  ellipse(ball.x - 2, ball.y - 2, 1.5, 1.5, '#ddd');
+}
+
+function drawAim() {
+  if (!input.aiming || !canShoot()) return;
+  const a = getAim();
+  if (a.power < 0.02) return;
+  const speed = a.power * MAX_SPEED * (game.beerActive ? BEER_MULT : 1);
+  const vx = Math.cos(a.ang) * speed, vy = Math.sin(a.ang) * speed;
+  // Short trajectory preview (only the first moment of flight, so it's still a challenge)
+  for (let i = 1; i <= 12; i++) {
+    const t = i * 0.045;
+    const x = ball.x + vx * t, y = ball.y + vy * t + 0.5 * GRAVITY * t * t;
+    ellipse(x, y, 3.2 - i * 0.18, 3.2 - i * 0.18, game.beerActive ? `rgba(242,177,52,${1 - i / 13})` : `rgba(255,255,255,${1 - i / 13})`);
+  }
+  // Drag line (what you're pulling)
+  ctx.setLineDash([6, 6]);
+  line(input.sx, input.sy, input.mx, input.my, 'rgba(0,0,0,.35)', 2);
+  ctx.setLineDash([]);
+}
+
+function drawParticles() {
+  for (const p of game.particles) {
+    ctx.globalAlpha = 1 - p.t / p.life;
+    if (p.spin != null) {
+      ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.spin + p.t * 8);
+      ctx.fillStyle = p.color; ctx.fillRect(-p.size / 2, -p.size / 4, p.size, p.size / 2);
+      ctx.restore();
+    } else ellipse(p.x, p.y, p.size, p.size, p.color);
+  }
+  ctx.globalAlpha = 1;
+  for (const f of game.floaters) {
+    ctx.globalAlpha = 1 - f.t / f.dur;
+    text(f.text, f.x, f.y - f.t * 30, { size: 18, color: f.color, outline: '#222' });
+  }
+  ctx.globalAlpha = 1;
+}
+
+/** The whole course: background, obstacles, ground, ball, Peter. */
+function drawWorld() {
+  const t = game.time;
+  drawBackground(L.def.theme, t);
+  L.windmills.forEach(drawWindmillTower);
+  L.windmills.forEach(drawWindmillBlades);
+  for (const m of L.movers) {
+    if (m.type === 'keg') drawKeg(m);
+    else if (m.type === 'chicken' && game.state !== 'chickenIntro') drawChicken(m.cx, m.cy + m.h / 2, m.facing, L.time);
+  }
+  drawWater(t);
+  drawGround();
+  drawCupAndFlag(t);
+  drawPickups(t);
+  if (!(game.state === 'chickenIntro')) {
+    const mood = ball.sunk ? 'happy' : (game.speech && LINES.water.includes(game.speech.text)) ? 'sad' : 'normal';
+    drawPeter(peter.x, peter.y, peter.facing, peterClubAngle(), 1, mood);
+  }
+  drawBall();
+  drawAim();
+  drawParticles();
+  if (game.speech) speechBubble(game.speech.text, peter.x + 6 * peter.facing, peter.y - 90);
+}
+
+/* =====================================================================
+   16. HUD & SCREENS
+   ===================================================================== */
+
+function drawHUD() {
+  const def = L.def;
+  rrect(8, 8, W - 16, 40, 12, 'rgba(20,20,40,.7)');
+  const holeLabel = def.bonus ? 'BONUS HOLE' : `Hole ${game.holeIdx + 1}/${HOLES.length}`;
+  text(`${holeLabel}  ·  ${def.name}`, 24, 28, { size: 18, align: 'left' });
+  text(`Par ${def.par}`, 620, 28, { size: 18, color: '#ffe066' });
+  text(`Strokes: ${game.strokes}`, 730, 28, { size: 18, color: '#7df9ff' });
+  if (!def.bonus) {
+    const played = game.scores.slice(0, game.holeIdx);
+    const diff = played.reduce((a, b) => a + b, 0) - HOLES.slice(0, game.holeIdx).reduce((a, h) => a + h.par, 0);
+    text(`Total ${diff > 0 ? '+' : ''}${diff === 0 ? 'E' : diff}`, 845, 28, { size: 16, color: '#ddd' });
+  }
+  // Pause button
+  button('II', W - 50, 12, 34, 32, () => pauseGame(), { size: 16 });
+
+  // Power-up buttons
+  const pu = [
+    { key: 'beer', label: 'Beer Boost', fn: useBeer },
+    { key: 'gadget', label: "Stewie's Gadget", fn: useGadget },
+    { key: 'brian', label: "Brian's Advice", fn: useBrian }
+  ];
+  pu.forEach((p, i) => {
+    const x = 12 + i * 178, y = H - 46, w = 170, h = 36;
+    const n = game.inventory[p.key];
+    const active = p.key === 'beer' && game.beerActive;
+    const hover = input.mx > x && input.mx < x + w && input.my > y && input.my < y + h;
+    rrect(x, y, w, h, 10, active ? 'rgba(242,177,52,.9)' : n > 0 ? (hover ? 'rgba(255,255,255,.95)' : 'rgba(255,255,255,.8)') : 'rgba(120,120,120,.6)', '#222', 2);
+    drawPickupIcon(p.key, x + 20, y + h / 2, 0.9);
+    text(`${p.label}`, x + 36, y + 13, { size: 13, color: '#222', align: 'left' });
+    text(`[${i + 1}]  x${n}`, x + 36, y + 27, { size: 12, color: '#555', align: 'left' });
+    uiButtons.push({ x, y, w, h, onClick: p.fn });
+  });
+
+  // Power meter while aiming
+  if (input.aiming && canShoot()) {
+    const a = getAim();
+    const mx = 600, my = H - 42, mw = 250, mh = 22;
+    rrect(mx - 4, my - 4, mw + 8, mh + 8, 8, 'rgba(20,20,40,.75)');
+    const g = ctx.createLinearGradient(mx, 0, mx + mw, 0);
+    g.addColorStop(0, '#7bd389'); g.addColorStop(0.6, '#ffd23f'); g.addColorStop(1, '#ff4d4d');
+    ctx.fillStyle = g; ctx.fillRect(mx, my, mw * a.power, mh);
+    ctx.strokeStyle = '#fff'; ctx.lineWidth = 2; ctx.strokeRect(mx, my, mw, mh);
+    text(`POWER ${Math.round(a.power * 100 * (game.beerActive ? BEER_MULT : 1))}%`, mx + mw / 2, my + mh / 2, { size: 14, outline: '#222', ow: 3 });
+  } else if (game.beerActive) {
+    text('BEER BOOST ACTIVE!', 725, H - 30, { size: 18, color: '#f2b134', outline: '#222' });
+  }
+
+  // Brian popping in with useless advice
+  if (game.brianSpeech) {
+    const s = game.brianSpeech;
+    const slide = Math.min(1, s.t * 4, (s.dur - s.t) * 4);
+    const bx = W - 60, by = H - 70 + (1 - slide) * 120;
+    drawBrian(bx, by, 1.4);
+    speechBubble(s.text, bx - 20, by - 26, { maxW: 280, size: 14, bg: '#f0f4ff' });
+  }
+
+  // Hole banner
+  if (game.banner) {
+    const b = game.banner;
+    const a = Math.min(1, b.t * 3, (b.dur - b.t) * 2);
+    ctx.globalAlpha = a;
+    rrect(W / 2 - 280, 80, 560, 96, 18, 'rgba(255,255,255,.93)', '#222', 4);
+    text(def.bonus ? 'SECRET BONUS HOLE' : `HOLE ${game.holeIdx + 1}  -  PAR ${def.par}`, W / 2, 106, { size: 18, color: '#c1121f' });
+    text(def.name, W / 2, 134, { size: 28, color: '#222' });
+    text(def.tip, W / 2, 162, { size: 14, color: '#555' });
+    ctx.globalAlpha = 1;
+  }
+
+  if (game.flash > 0) { ctx.fillStyle = `rgba(200,255,255,${game.flash})`; ctx.fillRect(0, 0, W, H); }
+}
+
+function dim(a = 0.55) { ctx.fillStyle = `rgba(10,10,25,${a})`; ctx.fillRect(0, 0, W, H); }
+
+function drawTitle() {
+  const t = game.time;
+  drawBackground('street', t);
+  // Grass strip
+  ctx.fillStyle = '#5fc44a'; ctx.fillRect(0, 440, W, 100);
+  ctx.fillStyle = '#3a8a2e'; ctx.fillRect(0, 440, W, 6);
+
+  // Title
+  ctx.save(); ctx.translate(W / 2, 100); ctx.rotate(Math.sin(t * 1.5) * 0.02);
+  text("PETER'S PUTT-PUTT", 0, -18, { size: 54, color: '#ffd23f', outline: '#222', ow: 10 });
+  text('PANDEMONIUM', 0, 40, { size: 60, color: '#ff4d6d', outline: '#222', ow: 10 });
+  ctx.restore();
+  text('A Quahog Mini-Golf Fan Game', W / 2, 188, { size: 18, color: '#fff', outline: '#1d3557', ow: 4 });
+
+  // Peter swinging on a loop
+  const cyc = t % 2.2;
+  let ang = CLUB_ADDRESS;
+  if (cyc < 0.9) ang = CLUB_ADDRESS + (cyc / 0.9) * 2.5;
+  else if (cyc < 1.05) ang = CLUB_ADDRESS + 2.5 - ((cyc - 0.9) / 0.15) * 4.4;
+  else if (cyc < 1.7) ang = CLUB_ADDRESS - 1.9;
+  else ang = CLUB_ADDRESS - 1.9 + ((cyc - 1.7) / 0.5) * 1.9;
+  drawPeter(200, 440, 1, ang, 2.2, cyc > 1.05 && cyc < 1.7 ? 'happy' : 'normal');
+  drawBrian(820, 405, 1.6);
+  if (cyc > 1.05 && cyc < 1.9) {
+    const k = (cyc - 1.05) / 0.85;
+    ellipse(262 + k * 560, 426 - Math.sin(k * Math.PI) * 220, 7, 7, '#fff', '#333', 1.5);
+  } else if (cyc <= 1.05) ellipse(258, 427, 7, 7, '#fff', '#333', 1.5);
+
+  button('TEE OFF!', W / 2 - 110, 222, 220, 56, () => startRound(), { size: 28 });
+  if (Store.data.bonusUnlocked) button('Bonus: Chicken Fight', W / 2 - 110, 294, 220, 42, () => startBonus(true), { size: 17, color: '#ff9f1c' });
+
+  const best = Store.data.bestTotal;
+  rrect(W / 2 - 200, 350, 400, 80, 14, 'rgba(20,20,40,.7)');
+  text(best == null ? 'No best score yet. Go make history!' : `Best round: ${best} (${best - TOTAL_PAR >= 0 ? '+' : ''}${best - TOTAL_PAR})`, W / 2, 368, { size: 16, color: '#ffe066' });
+  text('Drag back from anywhere, release to swing', W / 2, 392, { size: 14 });
+  text('1/2/3 power-ups  ·  P pause  ·  M mute', W / 2, 412, { size: 13, color: '#ccc' });
+
+  text('Fan project for personal use only. Family Guy (c) Fox. Not affiliated.', W / 2, H - 14, { size: 11, color: 'rgba(255,255,255,.8)' });
+  if (!Store.data.bonusUnlocked) text('Psst... finish near par to unlock something. Or type a certain bird.', W / 2, H - 34, { size: 12, color: 'rgba(255,255,255,.7)' });
+  text(Sound.muted ? 'MUTED' : '', W - 40, 20, { size: 12 });
+}
+
+function pauseGame() {
+  if (game.state !== 'play') return;
+  input.aiming = false;
+  game.state = 'paused';
+  Sound.click();
+}
+
+function drawPause() {
+  drawWorld(); drawHUD(); uiButtons = [];
+  dim(0.6);
+  rrect(W / 2 - 180, 110, 360, 330, 20, '#fff', '#222', 4);
+  text('PAUSED', W / 2, 150, { size: 36, color: '#c1121f' });
+  text('"I\'ll be right back. Gonna go get a snack."', W / 2, 188, { size: 13, color: '#555' });
+  button('Resume', W / 2 - 120, 215, 240, 48, () => { game.state = 'play'; Sound.click(); });
+  button('Restart Hole', W / 2 - 120, 275, 240, 48, () => { loadHole(currentDef()); if (game.playingBonus) { ball.hidden = false; } game.state = 'play'; });
+  button(Sound.muted ? 'Sound: OFF' : 'Sound: ON', W / 2 - 120, 335, 240, 40, () => Sound.toggleMute(), { size: 18, color: '#c8e7ff' });
+  button('Quit to Title', W / 2 - 120, 385, 240, 40, () => { game.state = 'title'; }, { size: 18, color: '#ffb3c1' });
+}
+
+function drawHoleComplete() {
+  drawWorld(); dim(0.55);
+  const r = game.holeResult;
+  const t = game.time;
+  rrect(W / 2 - 250, 90, 500, 340, 22, '#fffdf2', '#222', 4);
+  text(L.def.bonus ? 'CHICKEN DEFEATED!' : `HOLE ${game.holeIdx + 1} COMPLETE`, W / 2, 128, { size: 30, color: '#1d3557' });
+  text(L.def.name, W / 2, 162, { size: 18, color: '#666' });
+  ctx.save(); ctx.translate(W / 2, 214); ctx.scale(1 + Math.sin(t * 6) * 0.04, 1 + Math.sin(t * 6) * 0.04);
+  text(r.name, 0, 0, { size: 44, color: r.gaveUp ? '#888' : r.strokes <= r.par ? '#2a9d8f' : '#e76f51', outline: '#222', ow: 5 });
+  ctx.restore();
+  text(`${r.strokes} strokes  ·  Par ${r.par}`, W / 2, 262, { size: 22, color: '#222' });
+  if (r.record) text('NEW PERSONAL BEST!', W / 2, 294, { size: 20, color: '#c1121f' });
+  drawPeter(W / 2 - 180, 400, 1, r.gaveUp ? CLUB_ADDRESS : CLUB_ADDRESS - 1.9, 1.2, r.gaveUp ? 'sad' : 'happy');
+  const isLast = game.playingBonus || game.holeIdx === HOLES.length - 1;
+  button(isLast ? 'See Scorecard' : 'Next Hole', W / 2 - 100, 340, 200, 52, nextAfterHole, { size: 22 });
+  text('(click or press Space)', W / 2, 410, { size: 12, color: '#777' });
+}
+
+function drawScorecard() {
+  drawBackground('house', game.time);
+  dim(0.45);
+  rrect(40, 40, W - 80, 460, 22, '#fffdf2', '#222', 4);
+  text('SCORECARD', W / 2, 78, { size: 34, color: '#1d3557' });
+
+  const cols = HOLES.length + 1 + (game.bonusScore != null ? 1 : 0);
+  const labelW = 110, cw = Math.min(66, (W - 140 - labelW) / cols);
+  const x0 = (W - (labelW + cw * cols)) / 2, y0 = 118, rh = 40;
+  const rows = [
+    ['Hole', ...HOLES.map((_, i) => i + 1), 'Total'],
+    ['Par', ...HOLES.map(h => h.par), TOTAL_PAR],
+    ['Peter', ...HOLES.map((_, i) => game.scores[i] ?? '-'), game.scores.length ? game.scores.reduce((a, b) => a + (b || 0), 0) : '-'],
+    ['Best', ...Store.data.bestHoles.map(b => b ?? '-'), Store.data.bestTotal ?? '-']
+  ];
+  if (game.bonusScore != null) {
+    rows[0].push('Bonus'); rows[1].push(BONUS_HOLE.par); rows[2].push(game.bonusScore); rows[3].push(Store.data.bestBonus ?? '-');
+  }
+  rows.forEach((row, ri) => {
+    const y = y0 + ri * rh;
+    rrect(x0, y, labelW + cw * cols, rh - 4, 6, ri === 0 ? '#1d3557' : ri % 2 ? '#eef4f8' : '#fff');
+    row.forEach((cell, ci) => {
+      const cx = ci === 0 ? x0 + 12 : x0 + labelW + (ci - 1) * cw + cw / 2;
+      let color = ri === 0 ? '#fff' : '#222';
+      if (ri === 2 && ci > 0 && ci <= HOLES.length && typeof cell === 'number') color = cell < HOLES[ci - 1].par ? '#2a9d8f' : cell > HOLES[ci - 1].par ? '#e76f51' : '#222';
+      text(String(cell), cx, y + rh / 2 - 2, { size: 17, color, align: ci === 0 ? 'left' : 'center' });
+    });
+  });
+
+  let y = y0 + rows.length * rh + 26;
+  if (game.scores.length === HOLES.length) {
+    const total = game.scores.reduce((a, b) => a + b, 0);
+    const diff = total - TOTAL_PAR;
+    const verdict = diff <= -3 ? "Peter is a golf genius. Nobody saw this coming. Especially Peter."
+      : diff <= 0 ? "Under par! Peter's buying a round at the Clam. On Quagmire's tab."
+      : diff <= 6 ? "Not bad! Peter's calling it 'a moral victory.'"
+      : diff <= 15 ? "Well... Peter blames the course, the weather, and Canada."
+      : "Peter's been banned from three mini-golf courses. This is the fourth.";
+    text(`Total: ${total}  (${diff > 0 ? '+' : ''}${diff === 0 ? 'Even' : diff})`, W / 2, y, { size: 24, color: '#222' });
+    text(verdict, W / 2, y + 30, { size: 16, color: '#555' });
+    if (game.newRecord) text('NEW BEST ROUND!', W / 2, y + 58, { size: 20, color: '#c1121f' });
+  } else if (game.bonusScore != null) {
+    text(`Chicken hole: ${game.bonusScore} strokes. The feud continues...`, W / 2, y, { size: 20, color: '#222' });
+  }
+
+  const by = 430;
+  const showBonus = Store.data.bonusUnlocked && game.bonusScore == null;
+  const btns = [['Play Again', () => startRound(), '#ffd23f']];
+  if (showBonus) btns.push(['Secret Bonus Hole!', () => startBonus(false), '#ff9f1c']);
+  btns.push(['Title', () => { game.state = 'title'; }, '#c8e7ff']);
+  const bw = 210, gap = 20, total = btns.length * bw + (btns.length - 1) * gap;
+  btns.forEach(([label, fn, color], i) => button(label, W / 2 - total / 2 + i * (bw + gap), by, bw, 48, fn, { size: 20, color }));
+  if (showBonus && game.scores.length === HOLES.length && !game.playingBonus) {
+    text('BONUS HOLE UNLOCKED! A giant chicken wants your ball.', W / 2, by - 18, { size: 14, color: '#c1121f' });
+  }
+}
+
+/* ---------- Cutaway scenes ---------- */
+
+function drawCutawayScene(scene, t) {
+  switch (scene) {
+    case 'moon': {
+      ctx.fillStyle = '#0b0b2a'; ctx.fillRect(0, 0, W, H);
+      for (let i = 0; i < 80; i++) ellipse((i * 131) % W, (i * 71) % H, 1.3, 1.3, '#fff');
+      ellipse(780, 120, 50, 50, '#3a86ff'); ellipse(770, 110, 20, 14, '#5fc44a');
+      ctx.fillStyle = '#c9c9c9'; ctx.beginPath(); ctx.ellipse(W / 2, 560, 700, 200, 0, 0, Math.PI * 2); ctx.fill();
+      [[300, 400, 30], [600, 420, 20], [480, 380, 14]].forEach(([x, y, r]) => ellipse(x, y, r, r * 0.4, '#aaa'));
+      // Router + floating Peter
+      rrect(560, 330, 60, 24, 5, '#222'); line(575, 330, 570, 305, '#222', 3); line(605, 330, 610, 305, '#222', 3);
+      ctx.save(); ctx.translate(380, 360 + Math.sin(t * 2) * 12); ctx.rotate(Math.sin(t) * 0.2);
+      ellipse(0, -45, 30, 30, 'rgba(200,230,255,.35)', '#fff', 2);
+      drawPeter(0, 0, 1, null, 1, 'sad'); ctx.restore();
+      text('NO SIGNAL', 590, 290, { size: 14, color: '#ff4d4d' });
+      break;
+    }
+    case 'seagull': {
+      sky('#8fd3ff', '#fff3d6');
+      ctx.fillStyle = '#f2d59b'; ctx.fillRect(0, 400, W, 140);
+      ctx.fillStyle = '#3a86ff'; ctx.fillRect(0, 360, W, 40);
+      drawPeter(300, 440, 1, null, 1.5, 'sad');
+      // Seagull flying off with the club
+      const gx = 420 + t * 120, gy = 250 - t * 30 + Math.sin(t * 8) * 6;
+      const flap = Math.sin(t * 14) * 14;
+      ctx.strokeStyle = '#555'; ctx.lineWidth = 4;
+      ctx.beginPath(); ctx.moveTo(gx - 34, gy - flap); ctx.quadraticCurveTo(gx - 14, gy - 18, gx, gy); ctx.quadraticCurveTo(gx + 14, gy - 18, gx + 34, gy - flap); ctx.stroke();
+      ellipse(gx, gy + 4, 16, 9, '#fff', '#777', 2);
+      ctx.beginPath(); ctx.moveTo(gx + 14, gy); ctx.lineTo(gx + 26, gy + 3); ctx.lineTo(gx + 14, gy + 6); ctx.fillStyle = '#f4a300'; ctx.fill();
+      line(gx - 2, gy + 12, gx - 20, gy + 56, '#aaa', 3);
+      ctx.fillStyle = '#444'; ctx.fillRect(gx - 26, gy + 54, 12, 6);
+      text('HEY! THAT\'S A RENTAL!', 300, 300, { size: 20, color: '#222' });
+      break;
+    }
+    case 'vending': {
+      ctx.fillStyle = '#d9d2c3'; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#9e9380'; ctx.fillRect(0, 440, W, 100);
+      rrect(480, 120, 200, 320, 10, '#c1121f', '#6a040f', 4);
+      ctx.fillStyle = '#bde0fe'; ctx.fillRect(500, 140, 120, 200);
+      for (let r = 0; r < 4; r++) for (let c = 0; c < 3; c++) rrect(508 + c * 38, 150 + r * 48, 30, 36, 4, pick(['#ffd23f', '#7bd389', '#ff9f1c']));
+      ctx.fillStyle = '#222'; ctx.fillRect(500, 370, 120, 40);
+      drawPeter(420, 440, 1, null, 1.6, 'sad');
+      line(440, 372, 520, 390, SKIN, 12);
+      text(`DAY ${1 + Math.floor(t * 0.6)}`, 200, 150, { size: 40, color: '#222' });
+      // Beard grows over time
+      ellipse(432, 342 + t * 2, 18, 8 + t * 3, 'rgba(90,60,30,.8)');
+      break;
+    }
+    case 'tv': {
+      ctx.fillStyle = '#5a3d2b'; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#8a6a4a'; ctx.fillRect(0, 400, W, 140);
+      // Judge bench
+      rrect(330, 120, 300, 140, 8, '#6b4226', '#2e1b0e', 4);
+      ellipse(480, 110, 26, 26, SKIN); ctx.fillStyle = '#111'; ctx.fillRect(452, 128, 56, 40);
+      text('ORDER!', 480, 60, { size: 26, color: '#fff' });
+      // Defendant TV
+      rrect(620, 300, 130, 100, 10, '#333', '#111', 3);
+      rrect(632, 310, 106, 70, 6, '#bde0fe');
+      ellipse(665, 335, 4, 6, '#222'); ellipse(705, 335, 4, 6, '#222');
+      ctx.beginPath(); ctx.arc(685, 365, 12, Math.PI + 0.3, -0.3); ctx.strokeStyle = '#222'; ctx.lineWidth = 3; ctx.stroke();
+      ellipse(660 + (t * 20 % 10), 348 + (t * 30 % 20), 2, 4, '#3a86ff');
+      drawPeter(260, 440, 1, null, 1.5, 'normal');
+      text('THE PEOPLE v. SAMSUNG... I MEAN, A TV', 480, 500, { size: 18, color: '#fff' });
+      break;
+    }
+    case 'bowling': {
+      ctx.fillStyle = '#1b1035'; ctx.fillRect(0, 0, W, H);
+      ctx.fillStyle = '#d4a373'; ctx.beginPath(); ctx.moveTo(100, 480); ctx.lineTo(860, 480); ctx.lineTo(560, 240); ctx.lineTo(400, 240); ctx.fill();
+      for (let i = 0; i < 6; i++) line(400 + i * 32, 240, 100 + i * 152, 480, 'rgba(0,0,0,.08)', 2);
+      // Pins
+      [[480, 250], [465, 262], [495, 262], [450, 274], [480, 274], [510, 274]].forEach(([x, y]) => {
+        ellipse(x, y - 14, 5, 12, '#fff', '#999', 1); ctx.fillStyle = '#e63946'; ctx.fillRect(x - 5, y - 18, 10, 2);
+      });
+      // Watermelon rolling (and wobbling)
+      const k = Math.min(1, t / 3.5);
+      const wx = 480 + Math.sin(t * 5) * 20 * (1 - k), wy = 460 - k * 190, s = 1 - k * 0.7;
+      ellipse(wx, wy, 34 * s, 26 * s, '#2d6a4f', '#1b4332', 3);
+      for (let i = -2; i <= 2; i++) line(wx + i * 10 * s, wy - 24 * s, wx + i * 10 * s, wy + 24 * s, '#74c69d', 3 * s);
+      drawPeter(200, 480, 1, null, 1.5, 'happy');
+      text('LANE 6', 480, 130, { size: 30, color: '#ff5ec4', outline: '#fff', ow: 2 });
+      break;
+    }
+    case 'lighthouse': {
+      sky('#0d1b2a', '#1b263b');
+      ctx.fillStyle = '#1e3a5f'; ctx.fillRect(0, 380, W, 160);
+      for (let i = 0; i < 12; i++) line((i * 90 + t * 30) % W, 400 + (i % 3) * 30, (i * 90 + t * 30) % W + 30, 400 + (i % 3) * 30, 'rgba(255,255,255,.3)', 2);
+      ctx.fillStyle = '#eee'; ctx.beginPath(); ctx.moveTo(200, 400); ctx.lineTo(230, 150); ctx.lineTo(290, 150); ctx.lineTo(320, 400); ctx.fill();
+      ctx.fillStyle = '#e63946'; ctx.fillRect(218, 230, 84, 26); ctx.fillRect(210, 310, 100, 26);
+      rrect(222, 110, 76, 40, 6, '#333');
+      const lit = Math.sin(t * 3) > 0.6;
+      ellipse(260, 130, 16, 12, lit ? '#ffe066' : '#444');
+      drawPeter(262, 150, 1, null, 0.5, 'happy');
+      // Ship heading for the rocks
+      const sx = 820 - t * 50;
+      ctx.fillStyle = '#6d4c41'; ctx.beginPath(); ctx.moveTo(sx, 380); ctx.lineTo(sx + 120, 380); ctx.lineTo(sx + 100, 405); ctx.lineTo(sx + 20, 405); ctx.fill();
+      ctx.fillStyle = '#ffd67a'; ctx.fillRect(sx + 30, 360, 16, 12); ctx.fillRect(sx + 70, 360, 16, 12);
+      text('$0.43 SAVED!', 260, 70, { size: 24, color: '#7bd389' });
+      break;
+    }
+  }
+}
+
+function drawCutaway() {
+  const c = game.cutaway;
+  const cut = CUTAWAYS[c.idx];
+  drawCutawayScene(cut.scene, c.t);
+  // Caption bar
+  rrect(20, 16, W - 40, 58, 14, 'rgba(255,255,255,.95)', '#222', 3);
+  const lines = wrap(cut.text, W - 90, 18);
+  lines.forEach((l, i) => text(l, W / 2, 45 + (i - (lines.length - 1) / 2) * 22, { size: 18, color: '#222' }));
+  text('CUTAWAY  ·  click to skip', W - 30, H - 16, { size: 12, color: 'rgba(255,255,255,.7)', align: 'right' });
+  // Wipe-in/out transition
+  const a = c.t < 0.25 ? 1 - c.t / 0.25 : c.t > c.dur - 0.25 ? (c.t - (c.dur - 0.25)) / 0.25 : 0;
+  if (a > 0) { ctx.fillStyle = `rgba(255,255,255,${a})`; ctx.fillRect(0, 0, W, H); }
+}
+
+/* ---------- Chicken fight intro ---------- */
+
+function drawChickenIntro() {
+  const it = game.intro, t = it.t;
+  drawWorld();
+  const groundY = 440;
+  const bx = BONUS_HOLE.tee;
+  text('SECRET BONUS HOLE', W / 2, 80, { size: 34, color: '#ffd23f', outline: '#222', ow: 7 });
+  if (t < 1.4) {
+    // Chicken runs in and snatches the ball
+    const cx = W + 80 - (W + 80 - (bx + 90)) * Math.min(1, t / 1.2);
+    drawPeter(bx - 26, groundY, 1, CLUB_ADDRESS, 1, 'normal');
+    drawChicken(cx, groundY, -1, t, 1);
+    if (t < 1.2) ellipse(bx, groundY - BALL_R, BALL_R, BALL_R, '#fff', '#333', 1.5);
+    else ellipse(cx - 44, groundY - 88, BALL_R, BALL_R, '#fff', '#333', 1.5);
+    speechBubble(t < 1.2 ? 'BAWK!' : "Hey! That's my ball!", t < 1.2 ? cx : bx, groundY - 120);
+  } else if (t < 4.2) {
+    // The brawl: a dust cloud with limbs flying out
+    const cx = 240, cy = groundY - 60;
+    for (let i = 0; i < 12; i++) {
+      const a = i / 12 * Math.PI * 2 + t * 3;
+      ellipse(cx + Math.cos(a) * 60 + rand(-6, 6), cy + Math.sin(a) * 40 + rand(-6, 6), 40, 32, i % 2 ? '#d9d9d9' : '#bfbfbf');
+    }
+    ellipse(cx, cy, 70, 50, '#cfcfcf');
+    const f = Math.floor(t * 6) % 4;
+    if (f === 0) line(cx + 60, cy - 10, cx + 110, cy - 30, SKIN, 8);
+    if (f === 1) line(cx - 60, cy + 10, cx - 110, cy + 40, '#f4a300', 5);
+    if (f === 2) line(cx + 40, cy + 30, cx + 90, cy + 60, '#3f7d3a', 10);
+    if (f === 3) feathers(cx + rand(-40, 40), cy + rand(-30, 30));
+    drawParticles();
+    const words = ['POW!', 'BAM!', 'BAWK!', 'WHAM!', 'OOF!', 'KA-CHICK!'];
+    const wi = Math.floor(t * 3) % words.length;
+    ctx.save(); ctx.translate(cx + Math.sin(wi * 7) * 90, cy - 80 + Math.cos(wi * 3) * 20); ctx.rotate(Math.sin(wi) * 0.3);
+    text(words[wi], 0, 0, { size: 38, color: '#ffd23f', outline: '#c1121f', ow: 7 });
+    ctx.restore();
+  } else {
+    // Peter wins round one
+    drawPeter(bx - 26, groundY, 1, CLUB_ADDRESS - 1.9, 1, 'happy');
+    ellipse(bx, groundY - BALL_R, BALL_R, BALL_R, '#fff', '#333', 1.5);
+    const cx = 500 + (t - 4.2) * 40;
+    ctx.save(); ctx.translate(cx, groundY); ctx.rotate(0.15);
+    drawChicken(0, 0, -1, 0, 1, false);
+    ctx.restore();
+    for (let i = 0; i < 4; i++) ellipse(cx + 18 + Math.cos(t * 5 + i * 1.6) * 20, groundY - 125 + Math.sin(t * 5 + i * 1.6) * 6, 4, 4, '#ffd23f');
+    speechBubble("Got it back! Now to sink it before he wakes up!", bx, groundY - 100);
+  }
+  text('click to skip', W - 20, H - 16, { size: 12, color: 'rgba(255,255,255,.8)', align: 'right' });
+}
+
+/* =====================================================================
+   17. MAIN DRAW
+   ===================================================================== */
+
+function draw() {
+  uiButtons = [];
+  ctx.clearRect(0, 0, W, H);
+  switch (game.state) {
+    case 'title': drawTitle(); break;
+    case 'play': drawWorld(); drawHUD(); break;
+    case 'paused': drawPause(); break;
+    case 'holeComplete': drawHoleComplete(); break;
+    case 'cutaway': drawCutaway(); break;
+    case 'chickenIntro': drawChickenIntro(); break;
+    case 'scorecard': drawScorecard(); break;
+  }
+}
+
+/* =====================================================================
+   18. INPUT
+   ===================================================================== */
+
+function toGame(e) {
+  const r = canvas.getBoundingClientRect();
+  return { x: (e.clientX - r.left) / r.width * W, y: (e.clientY - r.top) / r.height * H };
+}
+
+canvas.addEventListener('pointerdown', e => {
+  Sound.init();
+  const p = toGame(e);
+  input.mx = p.x; input.my = p.y; input.down = true;
+  canvas.setPointerCapture(e.pointerId);
+
+  // Buttons first
+  for (const b of uiButtons) {
+    if (p.x > b.x && p.x < b.x + b.w && p.y > b.y && p.y < b.y + b.h) { Sound.click(); b.onClick(); return; }
+  }
+  switch (game.state) {
+    case 'play':
+      if (canShoot()) { input.aiming = true; input.sx = p.x; input.sy = p.y; }
+      break;
+    case 'holeComplete': nextAfterHole(); break;
+    case 'cutaway': endCutaway(); break;
+    case 'chickenIntro': endIntro(); break;
+  }
+});
+
+canvas.addEventListener('pointermove', e => {
+  const p = toGame(e);
+  input.mx = p.x; input.my = p.y;
+});
+
+canvas.addEventListener('pointerup', e => {
+  const p = toGame(e);
+  input.mx = p.x; input.my = p.y; input.down = false;
+  if (input.aiming) {
+    input.aiming = false;
+    if (canShoot()) {
+      const a = getAim();
+      if (a.power > 0.04) {
+        peter.backAng = CLUB_ADDRESS + a.power * 2.5;
+        shoot(a.power, a.ang);
+      }
+    }
+  }
+});
+canvas.addEventListener('pointercancel', () => { input.aiming = false; input.down = false; });
+
+window.addEventListener('keydown', e => {
+  Sound.init();
+  const k = e.key.toLowerCase();
+  if (k === 'm') { Sound.toggleMute(); return; }
+  switch (game.state) {
+    case 'title':
+      if (/^[a-z]$/.test(k)) {
+        game.secretBuf = (game.secretBuf + k).slice(-7);
+        if (game.secretBuf === 'chicken' && !Store.data.bonusUnlocked) {
+          Store.data.bonusUnlocked = true; Store.save(); Sound.squawk();
+        }
+      }
+      if (k === 'enter' || k === ' ') startRound();
+      break;
+    case 'play':
+      if (k === 'p' || k === 'escape') pauseGame();
+      else if (k === '1') useBeer();
+      else if (k === '2') useGadget();
+      else if (k === '3') useBrian();
+      break;
+    case 'paused':
+      if (k === 'p' || k === 'escape') game.state = 'play';
+      break;
+    case 'holeComplete':
+      if (k === 'enter' || k === ' ') nextAfterHole();
+      break;
+    case 'cutaway':
+      if (k === 'enter' || k === ' ' || k === 'escape') endCutaway();
+      break;
+    case 'chickenIntro':
+      if (k === 'enter' || k === ' ' || k === 'escape') endIntro();
+      break;
+  }
+  if ([' ', 'arrowup', 'arrowdown'].includes(k)) e.preventDefault();
+});
+
+// Auto-pause when the tab loses focus.
+document.addEventListener('visibilitychange', () => { if (document.hidden) pauseGame(); });
+
+/* =====================================================================
+   19. MAIN LOOP
+   ===================================================================== */
+
+let lastTime = performance.now();
+function frame(now) {
+  const dt = Math.min(1 / 30, (now - lastTime) / 1000);   // Clamp so a lag spike can't break physics
+  lastTime = now;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
